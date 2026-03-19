@@ -56,7 +56,6 @@ checkpoints_bypass_tps/
 ############################
 
 data/
-datasets/
 
 ############################
 # Python build
@@ -78,6 +77,7 @@ dist/
 ############################
 
 torch_compile_debug/
+debug/
 
 ############################
 # Temporary files
@@ -104,3 +104,7 @@ backbones/facebookresearch_dinov3*/
 *.so
 *.pyd
 *.dll
+
+*.jpg
+*.png
+*.txt

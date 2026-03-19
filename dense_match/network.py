@@ -26,12 +26,8 @@ def _gn_groups(ch: int, max_groups: int = 8) -> int:
 class MatchAttention(nn.Module):
     def __init__(self, d_model=128, nhead=4):
         super().__init__()
-        self.self_attn  = nn.MultiheadAttention(d_model, nhead,
-                                                 batch_first=True,
-                                                 dropout=0.0)
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead,
-                                                  batch_first=True,
-                                                  dropout=0.0)
+        self.self_attn  = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=0.0)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=0.0)
         self.norm1_A = nn.LayerNorm(d_model)
         self.norm1_B = nn.LayerNorm(d_model)
         self.norm2_A = nn.LayerNorm(d_model)
@@ -604,36 +600,44 @@ class DistillationLoss(nn.Module):
         x = xy[..., 0].clamp(min=-1.0 + 1.0/W, max=1.0 - 1.0/W)
         y = xy[..., 1].clamp(min=-1.0 + 1.0/H, max=1.0 - 1.0/H)
         return torch.stack([x, y], dim=-1)
-    
+
     def _warp_to_prob(self, warp_B: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        """将 warp 转换为软匹配概率"""
+        """
+        将 teacher warp 场转换为 coarse 匹配分布监督。
+        支持非方形网格，但你的当前场景一般是 H=W=32。
+
+        输入:
+            warp_B[b, i, j] = A中(i,j)位置在B中的normalized对应坐标
+        输出:
+            soft_prob: (B, H*W, H*W)
+        """
         B = warp_B.shape[0]
         N = H * W
         device = warp_B.device
         dtype = warp_B.dtype
-        
+
         if H == 1 and W == 1:
             return torch.ones((B, 1, 1), device=device, dtype=dtype)
-        
+
         # Token 坐标
         xs = (torch.arange(W, device=device, dtype=dtype) + 0.5) * (2.0 / W) - 1.0
         ys = (torch.arange(H, device=device, dtype=dtype) + 0.5) * (2.0 / H) - 1.0
         grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
         token_coords = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=1)
-        
+
         warp_flat = warp_B.reshape(B, N, 2)
         diff = warp_flat.unsqueeze(2) - token_coords.unsqueeze(0).unsqueeze(0)
         dist2 = (diff ** 2).sum(dim=-1)
-        
+
         sigma_x = 2.0 / W
         sigma_y = 2.0 / H
         sigma = 0.5 * (sigma_x + sigma_y)
-        
+
         soft_prob = torch.exp(-dist2 / (2 * sigma ** 2 + 1e-8))
         soft_prob = soft_prob / (soft_prob.sum(dim=-1, keepdim=True) + 1e-8)
-        
+
         return soft_prob
-    
+
     def forward(
         self,
         stu_output: Dict[str, torch.Tensor],
@@ -748,48 +752,6 @@ class DistillationLoss(nn.Module):
             "loss_smooth_coarse": float(loss_smooth_coarse.detach().item()),
             "loss_smooth_refine": float(loss_smooth_refine.detach().item()),
         }
-
-    def _warp_to_prob(
-        self,
-        warp_B: torch.Tensor,  # (B,H,W,2) normalized coords
-        H: int,
-        W: int,
-    ) -> torch.Tensor:
-        """
-        将 teacher warp 场转换为 coarse 匹配分布监督。
-        支持非方形网格，但你的当前场景一般是 H=W=32。
-
-        输入:
-            warp_B[b, i, j] = A中(i,j)位置在B中的normalized对应坐标
-        输出:
-            soft_prob: (B, H*W, H*W)
-        """
-        B = warp_B.shape[0]
-        N = H * W
-        device = warp_B.device
-        dtype = warp_B.dtype
-
-        if H == 1 and W == 1:
-            return torch.ones((B, 1, 1), device=device, dtype=dtype)
-
-        xs = (torch.arange(W, device=device, dtype=dtype) + 0.5) * (2.0 / W) - 1.0
-        ys = (torch.arange(H, device=device, dtype=dtype) + 0.5) * (2.0 / H) - 1.0
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        token_coords = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=1)  # (N,2)
-
-        warp_flat = warp_B.reshape(B, N, 2)  # (B,N,2)
-
-        diff = warp_flat.unsqueeze(2) - token_coords.unsqueeze(0).unsqueeze(0)  # (B,N,N,2)
-        dist2 = (diff ** 2).sum(dim=-1)  # (B,N,N)
-
-        # sigma 取 token 间距量级
-        sigma_x = 2.0 / W
-        sigma_y = 2.0 / H
-        sigma = 0.5 * (sigma_x + sigma_y)
-
-        soft_prob = torch.exp(-dist2 / (2 * sigma ** 2 + 1e-8))
-        soft_prob = soft_prob / (soft_prob.sum(dim=-1, keepdim=True) + 1e-8)
-        return soft_prob
 
 
 class AgriTPSLoss(nn.Module):

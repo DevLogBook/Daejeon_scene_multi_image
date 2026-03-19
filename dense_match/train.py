@@ -1,14 +1,13 @@
 import argparse
-import math
+import io
+import pathlib
+import platform
 import random
+import shutil
 import sys
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
-from collections import deque
-import shutil
-import platform
-import pathlib
-import io
 
 # 修复跨平台反序列化问题 (Linux -> Windows)
 if platform.system() == 'Windows':
@@ -20,9 +19,7 @@ import matplotlib.cm as cm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import albumentations as A  # pyright: ignore[reportMissingImports]
-from albumentations.pytorch import ToTensorV2  # pyright: ignore[reportMissingImports]
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 
@@ -39,10 +36,10 @@ from dense_match.network import (
     LocalGeometricConsistency,
     compute_photometric_loss, 
     compute_cycle_consistency_loss,
-    safe_grid_sample, 
     ssim_map,
     make_grid,
     )
+from dataset.dataset import MultiScaleDataset
 
 if str(ROMA_SRC) not in sys.path:
     sys.path.insert(0, str(ROMA_SRC))
@@ -235,14 +232,14 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
         return (x[0:1].detach().cpu() * 0.225 + 0.45).clamp(0, 1)
 
     with torch.no_grad():
-        # 1. 基础图像准备
+        # 基础图像准备
         img_a_dn = denorm(img_a)      # [1, 3, H, W]
         img_b_dn = denorm(img_b)      # [1, 3, H, W]
         # 对 img_b 进行 TPS 变换
         warped_b = F.grid_sample(img_b, dense_grid, padding_mode='zeros', align_corners=False)
         warped_b_dn = denorm(warped_b)
 
-        # 2. 效果评估图
+        # 效果评估图
         # A. 混合缝合图 (Alpha Blending) - 观察是否有重影 (Ghosting)
         blended_vis = (img_a_dn * 0.5 + warped_b_dn * 0.5)
 
@@ -255,7 +252,7 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
         # C. 误差图 (L1 Difference) - 越黑代表对齐越准
         diff_vis = (img_a_dn - warped_b_dn).abs().mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
 
-        # 3. 几何信号图
+        # 几何信号图
         # 彩色置信度 (Jet: 红色=极高，蓝色=极低)
         conf = matcher_out['confidence_AB'][0:1].detach().cpu()
         conf_up = F.interpolate(conf.unsqueeze(1), size=(H, W), mode='bilinear')[0]
@@ -266,7 +263,7 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
         # 网格叠加在混合图上，看形变逻辑是否符合图像特征
         overlay_vis = blended_vis[0] * 0.7 + grid_vis * 0.3
 
-        # 4. 拼接看板 (2 行 x 4 列)
+        # 拼接看板 (2 行 x 4 列)
         # 每张图都是 [3, H, W]
         row1 = torch.cat([img_a_dn[0], img_b_dn[0], warped_b_dn[0], blended_vis[0]], dim=2)
         row2 = torch.cat([checker_vis[0], diff_vis[0], conf_color, overlay_vis], dim=2)
@@ -299,121 +296,7 @@ class EMALossTracker:
         return self.ema_values.get(name, float('inf'))
 
 
-# 多尺度数据集
-class MultiScaleDataset(Dataset):
-    """
-    多尺度数据集，支持 train/val 划分
-    """
-    
-    def __init__(
-        self,
-        pairs_file: Path,
-        is_train: bool = True,
-        val_ratio: float = 0.1,
-        split_seed: int = 42,
-        return_split: str = 'train',
-    ):
-        self.is_train = is_train
-        self.return_split = return_split
-        
-        all_items: List[Tuple[Path, Path]] = []
-        base_dir = pairs_file.parent
-        
-        for line in pairs_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = [p for p in line.replace(",", " ").split() if p]
-            if len(parts) < 2:
-                continue
-            a = Path(parts[0]) if Path(parts[0]).is_absolute() else (base_dir / parts[0]).resolve()
-            b = Path(parts[1]) if Path(parts[1]).is_absolute() else (base_dir / parts[1]).resolve()
-            all_items.append((a, b))
-        
-        rng = random.Random(split_seed)
-        indices = list(range(len(all_items)))
-        rng.shuffle(indices)
-        
-        val_size = int(len(all_items) * val_ratio)
-        val_indices = set(indices[:val_size])
-        train_indices = set(indices[val_size:])
-        
-        if return_split == 'train':
-            self.items = [all_items[i] for i in sorted(train_indices)]
-        elif return_split == 'val':
-            self.items = [all_items[i] for i in sorted(val_indices)]
-        else:
-            self.items = all_items
-        
-        print(f"[Dataset] split={return_split}, total={len(all_items)}, using={len(self.items)}")
-        
-        # 尺寸池
-        self.pool_lowres = [(256, 256), (384, 384), (512, 512), (384, 512), (512, 384)]
-        self.pool_highres = [(512, 768), (768, 512), (512, 512), (640, 480), (480, 640)]
-        
-        # 预构建 transforms
-        self.transforms_lowres = {
-            (h, w): self._build_transform(h, w, scale=(0.6, 1.0))
-            for h, w in self.pool_lowres
-        }
-        self.transforms_highres = {
-            (h, w): self._build_transform(h, w, scale=(0.4, 1.0))
-            for h, w in self.pool_highres
-        }
-        
-        # 验证集固定尺寸
-        self.val_transform = A.Compose([
-            A.Resize(512, 512),
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2()
-        ], additional_targets={'image_b': 'image'})
-    
-    def _build_transform(self, target_h: int, target_w: int, scale: Tuple[float, float]) -> A.Compose:
-        if not self.is_train:
-            return A.Compose([
-                A.Resize(target_h, target_w),
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                ToTensorV2()
-            ], additional_targets={'image_b': 'image'})
-        
-        return A.Compose([
-            A.RandomResizedCrop(
-                size=(target_h, target_w),
-                scale=scale,
-                ratio=(0.75, 1.33),
-                p=1.0
-            ),
-            A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8),
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2()
-        ], additional_targets={'image_b': 'image'})
-    
-    def __len__(self) -> int:
-        return len(self.items)
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        path_a, path_b = self.items[idx]
-        
-        img_a = cv2.cvtColor(cv2.imread(str(path_a)), cv2.COLOR_BGR2RGB)
-        img_b = cv2.cvtColor(cv2.imread(str(path_b)), cv2.COLOR_BGR2RGB)
-        
-        orig_h, orig_w = img_a.shape[:2]
-        
-        # 验证集固定尺寸
-        if self.return_split == 'val':
-            transformed = self.val_transform(image=img_a, image_b=img_b)
-            return {"img_a": transformed["image"], "img_b": transformed["image_b"]}
-        
-        # 训练集动态选择
-        if max(orig_h, orig_w) > 1000:
-            target_h, target_w = random.choice(self.pool_highres)
-            transform = self.transforms_highres[(target_h, target_w)]
-        else:
-            target_h, target_w = random.choice(self.pool_lowres)
-            transform = self.transforms_lowres[(target_h, target_w)]
-        
-        transformed = transform(image=img_a, image_b=img_b)
-        return {"img_a": transformed["image"], "img_b": transformed["image_b"]}
+
 
 
 def multi_scale_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
