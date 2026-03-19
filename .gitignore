@@ -46,7 +46,7 @@ runs/
 *.pt
 *.ckpt
 *.bin
-
+backbones/
 checkpoints/
 checkpoints_distill/
 checkpoints_bypass_tps/
