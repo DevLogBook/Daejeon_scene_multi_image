@@ -37,6 +37,7 @@ Thumbs.db
 ############################
 
 runs/
+old_virsion/
 
 ############################
 # Model checkpoints

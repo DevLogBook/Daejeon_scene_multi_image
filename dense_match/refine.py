@@ -388,28 +388,46 @@ def compute_photometric_loss(img_A, img_B, warp_AB, confidence_AB, alpha=0.85):
     
     return loss
 
-def compute_cycle_consistency_loss(student, img_a, img_b, stu_out_ab):
-    """计算循环一致性损失 A -> B -> A"""
-    # 提取 A->B 的 warp 和 B 点的置信度
-    warp_ab = stu_out_ab["dense_grid"]  # (B, H, W, 2)
-    conf_a = stu_out_ab["matcher_out"]["confidence_AB"]
-    
-    # 第二次 Forward: 计算 B -> A
-    stu_out_ba = student(img_b, img_a)
-    warp_ba = stu_out_ba["dense_grid"]
-    
-    B, H, W, _ = warp_ab.shape
-    device = warp_ab.device
-    
-    # 生成 A 的原始网格
-    grid_identity = make_grid(B, H, W, device, warp_ab.dtype)
-    
-    # 采样：将 warp_ba 场按照 warp_ab 的指向采样回来
-    # back_to_a: A点经过BA变换后预测的原始位置
-    back_to_a = safe_grid_sample(warp_ba.permute(0, 3, 1, 2), warp_ab).permute(0, 2, 3, 1)
-    
-    cycle_dist = torch.norm(back_to_a - grid_identity, dim=-1)
-    return (cycle_dist * conf_a).mean()
+
+def compute_cycle_consistency_loss(stu_out_ab, stu_out_ba):
+    """计算 A->B->A 的坐标回环误差"""
+    grid_ab = stu_out_ab['dense_grid']  # [B, H, W, 2] -> 全分辨率
+    grid_ba = stu_out_ba['dense_grid']  # [B, H, W, 2]
+    conf_a = stu_out_ab['matcher_out']['confidence_AB']  # [B, h_m, w_m] -> 匹配器分辨率 (96)
+
+    B, H, W, _ = grid_ab.shape
+    device = grid_ab.device
+
+    # 构建 Identity 网格 (全分辨率)
+    identity = torch.stack(torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
+    )[::-1], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
+
+    # 采样回环坐标
+    back_to_a = F.grid_sample(
+        grid_ba.permute(0, 3, 1, 2),
+        grid_ab,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=False
+    ).permute(0, 2, 3, 1)  # [B, H, W, 2]
+
+    # 计算欧氏距离误差 [B, H, W]
+    cycle_error = torch.norm(back_to_a - identity, dim=-1)
+
+    if conf_a.shape[-2:] != (H, W):
+        # [B, 96, 96] -> [B, 1, 96, 96] -> 插值 -> [B, 384, 384]
+        conf_a = F.interpolate(
+            conf_a.unsqueeze(1),
+            size=(H, W),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(1)
+
+    # 4. 加权求平均：只在模型认为有匹配的地方计算回环损失
+    return (cycle_error * conf_a).mean()
 
 if __name__ == "__main__":
     pass

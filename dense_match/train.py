@@ -9,7 +9,6 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 
-# 修复跨平台反序列化问题 (Linux -> Windows)
 if platform.system() == 'Windows':
     pathlib.PosixPath = pathlib.WindowsPath
 
@@ -296,9 +295,6 @@ class EMALossTracker:
         return self.ema_values.get(name, float('inf'))
 
 
-
-
-
 def multi_scale_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """多尺度 collate：同一 batch 内 resize 到第一个样本的尺寸"""
     if len(batch) == 0:
@@ -444,11 +440,11 @@ def save_checkpoint(
     
     last_path = save_dir / "last.pt"
     torch.save(payload, last_path)
-    print(f"The last weight file update ! val loss: {val_loss:.6f}")
+    print(f"The last weight file update ! val loss: {val_loss:.6f} best val loss: {best_val_loss:.6f}")
     
     if is_best:
         shutil.copyfile(last_path, save_dir / "best.pt")
-        print(f" ✅ New best val_loss: {val_loss:.6f}")
+        print(f"✅ New best val_loss: {val_loss:.6f}")
     
     return last_path
 
@@ -599,7 +595,7 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 def get_phase_config(epoch):
-    if epoch <= 5:
+    if epoch <= 10:
         return {
             "phase": "DISTILL",
             "weights": {"distill": 1.0, "fold": 0.0, "photo": 0.0, "cycle": 0.0, "geo": 0.5},
@@ -643,7 +639,7 @@ def main() -> None:
     val_dataset = MultiScaleDataset(args.pairs_file, is_train=False, val_ratio=args.val_ratio, return_split='val')
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
-                              num_workers=args.num_workers, collate_fn=multi_scale_collate_fn)
+                              num_workers=args.num_workers, collate_fn=multi_scale_collate_fn, pin_memory=True, persistent_workers=True,prefetch_factor=2)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
                             num_workers=args.num_workers, collate_fn=multi_scale_collate_fn)
 
@@ -678,7 +674,7 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     loss_tracker = EMALossTracker(alpha=args.ema_alpha)
-    
+
     # 损失函数类
     distill_loss_fn = DistillationLoss(
         alpha=args.alpha,
@@ -696,6 +692,25 @@ def main() -> None:
     start_epoch = 1
     global_step = 0
     best_val_loss = float("inf")
+
+    if args.resume:
+        start_epoch, global_step, best_val_loss, train_loss_ema = load_checkpoint(
+            ckpt_path=args.resume,
+            student=student,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler if use_amp else None,
+            device=device,
+        )
+        loss_tracker = EMALossTracker(alpha=args.ema_alpha)
+        loss_tracker.ema_values['total'] = train_loss_ema
+
+        # scheduler 需要跳过已执行的 step
+        for _ in range(global_step):
+            scheduler.step()
+
+        print(f"Resumed from epoch={start_epoch}, step={global_step}, "
+              f"best_val={best_val_loss:.4f}")
 
     for epoch in range(start_epoch, args.epochs + 1):
         cfg = get_phase_config(epoch)
@@ -885,26 +900,6 @@ def main() -> None:
         print(f"[epoch {epoch}] Done. EMA={loss_tracker.get_ema('total'):.4f}")
 
     writer.close()
-
-def compute_cycle_consistency_loss(stu_out_ab, stu_out_ba):
-    """计算 A->B->A 的坐标回环误差"""
-    grid_ab = stu_out_ab['dense_grid']
-    grid_ba = stu_out_ba['dense_grid']
-    conf_a = stu_out_ab['matcher_out']['confidence_AB']
-    
-    B, H, W, _ = grid_ab.shape
-    # 构建 Identity 网格
-    identity = torch.stack(torch.meshgrid(
-        torch.linspace(-1, 1, H, device=grid_ab.device),
-        torch.linspace(-1, 1, W, device=grid_ab.device),
-        indexing='ij'
-    )[::-1], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
-    
-    # 采样回环坐标
-    back_to_a = F.grid_sample(grid_ba.permute(0, 3, 1, 2), grid_ab, align_corners=False, padding_mode='zeros').permute(0, 2, 3, 1)
-    cycle_error = torch.norm(back_to_a - identity, dim=-1)
-    
-    return (cycle_error * conf_a).mean()
 
 
 if __name__ == "__main__":

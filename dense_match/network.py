@@ -124,7 +124,7 @@ class MatchWindowAttention(nn.Module):
 
 
 class LocalGeometricValidator(nn.Module):
-    """验证候选匹配的局部几何一致性 (修复非正方形多尺度 Bug)"""
+    """验证候选匹配的局部几何一致性 """
     def __init__(self, neighbor_radius=3):
         super().__init__()
         self.radius = neighbor_radius
@@ -203,7 +203,7 @@ class MultiPeakAwareAttention(nn.Module):
         # 加权求和得到精细化坐标
         refined_warp = (topk_positions * soft_weights.unsqueeze(-1)).sum(dim=2)
         
-        # 计算匹配熵（用于后续置信度评估）
+        # 计算匹配熵
         prob_dist = F.softmax(sim_matrix / self.temp, dim=-1)
         entropy = -(prob_dist * (prob_dist + 1e-8).log()).sum(dim=-1)
         
@@ -460,7 +460,7 @@ class AgriTPSStitcher(nn.Module):
             coarse_hw=hc_wc
         )
         
-        # 3. 生成 TPS 密集网格
+        # 生成 TPS 密集网格
         dense_grid = self.grid_gen(tps_out['delta_cp'], target_shape=img_A.shape[-2:])
 
         # 4. 训练时：将生成的密集场传回进行折叠惩罚检查
@@ -478,11 +478,11 @@ class AgriTPSStitcher(nn.Module):
 class LocalGeometricConsistency(nn.Module):
     def __init__(self):
         super().__init__()
-        # 1. 二阶拉普拉斯算子：检测非线性形变（仿射变换下，二阶导数为0）
+        # 二阶拉普拉斯算子：检测非线性形变（仿射变换下，二阶导数为0）
         lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
         self.register_buffer('laplacian', lap.view(1, 1, 3, 3))
         
-        # 2. 一阶 Sobel 算子：检测位移突变
+        # 一阶 Sobel 算子：检测位移突变
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
         self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
         self.register_buffer('sobel_y', sobel_x.T.contiguous().view(1, 1, 3, 3))
@@ -495,7 +495,7 @@ class LocalGeometricConsistency(nn.Module):
         B, H, W, _ = flow.shape
         f = flow.permute(0, 3, 1, 2)  # [B, 2, H, W]
         
-        # 【核心修复】：强制 buffer 与输入 f 的设备和 dtype 对齐，防止 AMP 或设备冲突
+        # 强制 buffer 与输入 f 的设备和 dtype 对齐，防止 AMP 或设备冲突
         sx = self.sobel_x.to(device=f.device, dtype=f.dtype)
         sy = self.sobel_y.to(device=f.device, dtype=f.dtype)
         lap = self.laplacian.to(device=f.device, dtype=f.dtype)
@@ -510,12 +510,12 @@ class LocalGeometricConsistency(nn.Module):
         # 统一形状处理 [B*2, 1, H, W]
         f_reshaped = f.reshape(B * 2, 1, H, W)
         
-        # 1. 一阶平滑惩罚（惩罚突变）
+        # 一阶平滑惩罚（惩罚突变）
         grad_x = F.conv2d(f_reshaped, sx, padding=1).abs()
         grad_y = F.conv2d(f_reshaped, sy, padding=1).abs()
         first_order = (grad_x + grad_y).reshape(B, 2, H, W).mean(1, keepdim=True)
         
-        # 2. 二阶平滑惩罚（惩罚非仿射扭曲，保持局部刚性）
+        # 二阶平滑惩罚（惩罚非仿射扭曲，保持局部刚性）
         second_order = F.conv2d(f_reshaped, lap, padding=1).abs()
         second_order = second_order.reshape(B, 2, H, W).mean(1, keepdim=True)
         
@@ -804,17 +804,17 @@ class AgriTPSLoss(nn.Module):
     def forward(self, img_A: torch.Tensor, warped_img_B: torch.Tensor, 
                 delta_C: torch.Tensor, confidence: torch.Tensor) -> dict:
         
-        # 1. 自动计算有效重叠区掩码 (假设无像素区域为绝对 0)
+        # 自动计算有效重叠区掩码 (假设无像素区域为绝对 0)
         # 考虑到差值容差，只要 img_A 或 warped_img_B 有像素即可
         mask_A = (img_A.sum(dim=1, keepdim=True) > 0).float()
         mask_B = (warped_img_B.sum(dim=1, keepdim=True) > 0).float()
         overlap_mask = mask_A * mask_B
 
-        # 2. 如果 confidence 尺寸不匹配 (如 64x64)，需上采样到全图尺寸
+        # 如果 confidence 尺寸不匹配 (如 64x64)，需上采样到全图尺寸
         if confidence.shape[-2:] != img_A.shape[-2:]:
             confidence = F.interpolate(confidence, size=img_A.shape[-2:], mode='bilinear', align_corners=False)
 
-        # 3. 计算各项损失
+        # 计算各项损失
         loss_photo = self.compute_photometric_loss(img_A, warped_img_B, overlap_mask, confidence)
         loss_smooth = self.compute_smoothness_loss(delta_C)
 

@@ -466,12 +466,6 @@ class BypassTPSEstimator(nn.Module):
                           [+ anti_entropy] [+ cf_consistency]）
     3. FlowAggregator（GATED门控残差修正）→ 最终控制点偏移
     4. CombinedFoldingPenalty（训练时约束，推理时跳过密集计算）
-
-    关键修复（相比原版）：
-    - 删除冗余的 FlowAggregator 实例（原代码实例化但未使用）
-    - encoder in_ch 在 __init__ 中静态固定（消除动态通道不匹配）
-    - anti_entropy/cf_cons 变量改为局部初始化None避免作用域问题
-    - FoldingPenaltyDense 返回Tuple，统一在此处解包
     """
 
     def __init__(
