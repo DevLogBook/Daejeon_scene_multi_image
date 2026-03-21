@@ -69,6 +69,16 @@ class MultiScaleDataset(Dataset):
             (h, w): self._build_transform(h, w, scale=(0.4, 1.0))
             for h, w in self.pool_highres
         }
+        self.color_norm_transform = A.Compose([
+            A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+
+        self.val_color_norm = A.Compose([
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
 
         # 验证集固定尺寸
         self.val_transform = A.Compose([
@@ -81,8 +91,6 @@ class MultiScaleDataset(Dataset):
         if not self.is_train:
             return A.Compose([
                 A.Resize(target_h, target_w),
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                ToTensorV2()
             ], additional_targets={'image_b': 'image'})
 
         return A.Compose([
@@ -92,9 +100,6 @@ class MultiScaleDataset(Dataset):
                 ratio=(0.75, 1.33),
                 p=1.0
             ),
-            A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8),
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2()
         ], additional_targets={'image_b': 'image'})
 
     def __len__(self) -> int:
@@ -121,5 +126,9 @@ class MultiScaleDataset(Dataset):
             target_h, target_w = random.choice(self.pool_lowres)
             transform = self.transforms_lowres[(target_h, target_w)]
 
-        transformed = transform(image=img_a, image_b=img_b)
-        return {"img_a": transformed["image"], "img_b": transformed["image_b"]}
+        geo_transformed = transform(image=img_a, image_b=img_b)
+        color_trans = self.val_color_norm if self.return_split == 'val' else self.color_norm_transform
+        tensor_a = color_trans(image=geo_transformed["image"])["image"]
+        tensor_b = color_trans(image=geo_transformed["image_b"])["image"]
+
+        return {"img_a": tensor_a, "img_b": tensor_b}

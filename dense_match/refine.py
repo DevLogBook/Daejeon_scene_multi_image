@@ -191,7 +191,7 @@ class WarpRefiner(nn.Module):
         C: int,
         hidden: int = 96,
         num_blocks: int = 2,
-        delta_scale: float = 0.4,
+        delta_scale: float = 0.25,
         residual_overlap: bool = True,
         corr_radius: int = 2
     ):
@@ -299,38 +299,45 @@ class WarpRefiner(nn.Module):
         return refined_warp, overlap_logits, overlap
 
 
-def ssim_map(img1, img2, window_size=11, sigma=1.5):
-    """
-    计算两张图之间的像素级 SSIM Map
-    """
-    _, C, _, _ = img1.shape
-    
+def ssim_map(img1, img2, mask, window_size=11, sigma=1.5):
+    _, C, H, W = img1.shape
+    device = img1.device
+
+    # 1. 准备高斯窗口
     def gaussian(window_size, sigma):
-        gauss = torch.exp(-(torch.arange(window_size).float() - window_size//2)**2 / (2 * sigma**2))
+        gauss = torch.exp(-(torch.arange(window_size).float() - window_size // 2) ** 2 / (2 * sigma ** 2))
         return gauss / gauss.sum()
 
-    _1D_window = gaussian(window_size, sigma).unsqueeze(1).to(img1.device, img1.dtype)
+    _1D_window = gaussian(window_size, sigma).unsqueeze(1).to(device, img1.dtype)
     window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
     window = window.expand(C, 1, window_size, window_size).contiguous()
 
-    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=C)
-    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=C)
+    # 2. 预计算 Mask 的卷积权重（用于归一化均值）
+    # mask 形状假设为 [B, 1, H, W]
+    mask_weight = F.conv2d(mask.expand(-1, C, -1, -1), window, padding=window_size // 2, groups=C)
+    mask_weight = mask_weight.clamp(min=1e-6)  # 避免除零
+
+    # 3. 计算归一化均值 mu = E[x] = conv(img * mask) / conv(mask)
+    mu1 = F.conv2d(img1 * mask, window, padding=window_size // 2, groups=C) / mask_weight
+    mu2 = F.conv2d(img2 * mask, window, padding=window_size // 2, groups=C) / mask_weight
 
     mu1_sq = mu1.pow(2)
     mu2_sq = mu2.pow(2)
     mu1_mu2 = mu1 * mu2
 
-    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=C) - mu1_sq
-    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=C) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=C) - mu1_mu2
+    # 4. 计算归一化方差 sigma^2 = E[x^2] - (E[x])^2
+    # E[x^2] = conv(img^2 * mask) / conv(mask)
+    sigma1_sq = F.conv2d((img1 * img1) * mask, window, padding=window_size // 2, groups=C) / mask_weight - mu1_sq
+    sigma2_sq = F.conv2d((img2 * img2) * mask, window, padding=window_size // 2, groups=C) / mask_weight - mu2_sq
+    sigma12 = F.conv2d((img1 * img2) * mask, window, padding=window_size // 2, groups=C) / mask_weight - mu1_mu2
 
-    C1 = 0.01**2
-    C2 = 0.03**2
-    
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+
+    # SSIM 公式
     ssim_n = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
     ssim_d = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
-    
-    return ssim_n / ssim_d
+
+    return ssim_n / (ssim_d + 1e-8)
 
 def compute_cycle_loss(warp_AB, warp_BA, conf_A):
     """
@@ -350,75 +357,80 @@ def compute_cycle_loss(warp_AB, warp_BA, conf_A):
     cycle_dist = torch.norm(identity_A_pred - grid_A, dim=-1)
     return (cycle_dist * conf_A).mean()
 
-import torch.nn.functional as F
 
-def compute_photometric_loss(img_A, img_B, warp_AB, confidence_AB, alpha=0.85):
+def compute_photometric_loss(img_a, img_b, dense_grid, confidence, alpha=0.85):
     """
-    修正后的光度损失：仅计算有效重叠区域
+    高精度光度损失：支持 512x512 细碎纹理对齐
     """
-    B, C, H, W = img_A.shape
-    device = img_A.device
+    B, C, H, W = img_a.shape
+    device = img_a.device
 
-    warped_B = F.grid_sample(img_B, warp_AB, mode='bilinear', padding_mode='zeros', align_corners=False)
-    
-    # 创建 img_B 尺寸的全 1 矩阵，进行同样的 Warp
-    ones = torch.ones((B, 1, H, W), device=device, dtype=img_A.dtype)
-    mask_B = F.grid_sample(ones, warp_AB, mode='nearest', padding_mode='zeros', align_corners=False)
-    
-    # 只要采样值 > 0.99，说明是 img_B 映射过来的有效像素
-    overlap_mask = (mask_B > 0.99).float() 
+    # 1. 采样 warped 图 (跟随 dense_grid 的尺寸)
+    warped_b = F.grid_sample(img_b, dense_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
 
-    # L1 Loss Map
-    l1_map = torch.abs(img_A - warped_B).mean(dim=1, keepdim=True) # [B, 1, H, W]
-    
-    # SSIM Map (注意：ssim_map 原本返回 0~1，我们需要 1 - SSIM 作为 Loss)
-    s_map = ssim_map(img_A, warped_B) # [B, C, H, W] 或 [B, 1, H, W]
+    target_hw = warped_b.shape[-2:]
+    if img_a.shape[-2:] != target_hw:
+        img_curr = F.interpolate(img_a, size=target_hw, mode='bilinear', align_corners=False)
+    else:
+        img_curr = img_a
+
+    # 生成有效重叠掩码 (Overlap Mask)
+    ones = torch.ones((B, 1, *target_hw), device=device, dtype=img_a.dtype)
+    mask = F.grid_sample(ones, dense_grid, mode='nearest', padding_mode='zeros', align_corners=False)
+    mask = (mask > 0.9).float()
+
+    l1_map = torch.abs(img_curr - warped_b).mean(dim=1, keepdim=True)
+    # 调用上个回合定义的 ssim_map_v2 (带 mask)
+    s_map = ssim_map(img_curr, warped_b, mask)
     ssim_loss_map = 1 - s_map.mean(dim=1, keepdim=True)
 
     photo_loss_map = alpha * ssim_loss_map + (1 - alpha) * l1_map
 
-    # 确保 confidence_AB 维度对齐 [B, 1, H, W]
-    if confidence_AB.ndim == 3:
-        confidence_AB = confidence_AB.unsqueeze(1)
-    
-    final_weight = overlap_mask * confidence_AB
+    # 5. 置信度对齐
+    if confidence.ndim == 3: confidence = confidence.unsqueeze(1)
+    conf = F.interpolate(confidence, size=target_hw, mode="bilinear") if confidence.shape[
+                                                                             -2:] != target_hw else confidence
 
-    # 使用 1e-6 防止重叠面积为 0 时除以零
-    loss = (photo_loss_map * final_weight).sum() / (final_weight.sum() + 1e-6)
-    
-    return loss
+    total_weight = conf * mask
+    return (photo_loss_map * total_weight).sum() / (total_weight.sum() + 1e-6)
 
 
 def compute_cycle_consistency_loss(stu_out_ab, stu_out_ba):
-    """计算 A->B->A 的坐标回环误差"""
-    grid_ab = stu_out_ab['dense_grid']  # [B, H, W, 2] -> 全分辨率
-    grid_ba = stu_out_ba['dense_grid']  # [B, H, W, 2]
-    conf_a = stu_out_ab['matcher_out']['confidence_AB']  # [B, h_m, w_m] -> 匹配器分辨率 (96)
+    """
+    高鲁棒性 A->B->A 坐标回环误差计算 (防坍塌设计)
+    """
+    # 切断前向梯度的传播 (Stop-Gradient)，将 A->B 的场作为绝对的 "伪标签"，只允许梯度更新 B->A 的网络参数。
+    # 这打破了前向和后向网络共同退化为恒等映射(Identity)的捷径。
+    grid_ab = stu_out_ab['dense_grid'].detach()  # [B, H, W, 2] -> 必须 detach
+    conf_a = stu_out_ab['matcher_out']['confidence_AB'].detach()  # [B, h_m, w_m] -> 必须 detach
+
+    grid_ba = stu_out_ba['dense_grid']  # [B, H, W, 2] -> 保留梯度
 
     B, H, W, _ = grid_ab.shape
     device = grid_ab.device
 
     # 构建 Identity 网格 (全分辨率)
-    identity = torch.stack(torch.meshgrid(
-        torch.linspace(-1, 1, H, device=device),
-        torch.linspace(-1, 1, W, device=device),
-        indexing='ij'
-    )[::-1], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
+    # y 轴和 x 轴生成时必须与 make_grid 的 align_corners=False 规范严格对齐
+    ys = (torch.arange(H, device=device, dtype=grid_ab.dtype) + 0.5) * (2.0 / H) - 1.0
+    xs = (torch.arange(W, device=device, dtype=grid_ab.dtype) + 0.5) * (2.0 / W) - 1.0
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+    identity = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
 
     # 采样回环坐标
+    # 拿着 A->B 的坐标，去 B->A 的形变场里查表，看看它指回 A 的哪里
     back_to_a = F.grid_sample(
         grid_ba.permute(0, 3, 1, 2),
         grid_ab,
         mode='bilinear',
-        padding_mode='border',
+        padding_mode='border',  # 使用 border 比 zeros 更安全，防止边缘点回环出界导致大幅误判
         align_corners=False
     ).permute(0, 2, 3, 1)  # [B, H, W, 2]
 
     # 计算欧氏距离误差 [B, H, W]
     cycle_error = torch.norm(back_to_a - identity, dim=-1)
 
+    # 置信度尺寸对齐
     if conf_a.shape[-2:] != (H, W):
-        # [B, 96, 96] -> [B, 1, 96, 96] -> 插值 -> [B, 384, 384]
         conf_a = F.interpolate(
             conf_a.unsqueeze(1),
             size=(H, W),
@@ -426,8 +438,14 @@ def compute_cycle_consistency_loss(stu_out_ab, stu_out_ba):
             align_corners=False
         ).squeeze(1)
 
-    # 4. 加权求平均：只在模型认为有匹配的地方计算回环损失
-    return (cycle_error * conf_a).mean()
+    # 动态掩码阈值截断，极低置信度的区域往往是视野外(Out-of-FOV)或严重遮挡，强行计算回环会让网络混乱。
+    # 丢弃掉 conf < 0.1 的死区，只在有效区域计算 loss
+    valid_mask = (conf_a > 0.1).float()
+
+    # 加权求平均：依靠 detach 后的 confidence 作为权重，防止网络通过降低置信度来逃避 Loss
+    weighted_error = cycle_error * conf_a * valid_mask
+
+    return weighted_error.sum() / (valid_mask.sum() + 1e-6)
 
 if __name__ == "__main__":
     pass

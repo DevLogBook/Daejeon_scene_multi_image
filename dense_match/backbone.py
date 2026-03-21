@@ -53,11 +53,11 @@ class MobileViTBackbone(nn.Module):
             new_state_dict[new_key] = v
 
         msg = self.mobilevit.load_state_dict(new_state_dict, strict=False)
-        # Avoid UnicodeEncodeError on Windows consoles using GBK codepage.
-        print("Backbone MobileViT load success!")
+        if len(msg.missing_keys) > 0:
+            print(f"[Warning] Backbone MobileViT missing {len(msg.missing_keys)} keys (e.g., {msg.missing_keys[:3]})")
+        print("Backbone MobileViT load finished!")
 
         # mobilevitv2_050 在 out_indices=2 时的通道数通常是 128 或 144
-        # 我们用一个 dummy input 测试一下来获取精确通道数
         dummy_input = torch.randn(1, 3, 256, 256)
 
         with torch.no_grad():
@@ -69,14 +69,14 @@ class MobileViTBackbone(nn.Module):
         self.dim_align_coarse = nn.Sequential(
             nn.Conv2d(timm_ch_coarse, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.GELU()
         )
         
         # 为 Fine 特征 (64x64) 设置维度对齐
         self.dim_align_fine = nn.Sequential(
             nn.Conv2d(timm_ch_fine, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.GELU()
         )
 
     def forward(self, x):

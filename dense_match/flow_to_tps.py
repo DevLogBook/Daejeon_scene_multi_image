@@ -240,8 +240,8 @@ class FlowAggregator(nn.Module):
         grid_size: int = 10,
         feat_channels: int = 128,
         hidden_ch: int = 48,
-        in_ch: int = 5,          # 输入通道数（由外部按实际信号数决定）
-        delta_scale: float = 0.2,
+        in_ch: int = 5,
+        delta_scale: float = 0.25,
     ):
         super().__init__()
         self.grid_size  = grid_size
@@ -360,44 +360,42 @@ class FoldingPenaltyDense(nn.Module):
 
     注意：此处使用归一化雅可比（除以像素间距）以实现尺度不变性。
     """
-
     def __init__(
-        self,
-        stride: int = 4,
-        epsilon: float = 0.01,
+            self,
+            target_eval_size: int = 16,  # 锁定评估分辨率的基准大小 (等效于以前 128/4 = 32)
+            epsilon: float = 0.01,
     ):
         super().__init__()
-        self.stride  = stride
+        self.target_eval_size = target_eval_size
         self.epsilon = epsilon
 
     def forward(
-        self, dense_field: torch.Tensor,  # (B, H, W, 2)
+            self, dense_field: torch.Tensor,  # (B, H, W, 2)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        返回:
-            fold_loss: scalar
-            fold_mask: (B, Hs-1, Ws-1) bool，True=折叠（用于诊断/可视化）
-        """
-        s     = self.stride
-        field = dense_field.permute(0, 3, 1, 2)  # (B,2,H,W)
+        field = dense_field.permute(0, 3, 1, 2)  # (B, 2, H, W)
+        B, _, H, W = field.shape
 
-        # stride 下采样
-        field_s = field[:, :, ::s, ::s]           # (B,2,Hs,Ws)
-        Hs, Ws  = field_s.shape[2:]
+        # 动态计算 stride，确保下采样后的宽/高大约等于 target_eval_size
+        stride_h = max(1, H // self.target_eval_size)
+        stride_w = max(1, W // self.target_eval_size)
 
-        # 归一化坐标系下的像素间距
+        # 动态下采样
+        field_s = field[:, :, ::stride_h, ::stride_w]  # (B, 2, Hs, Ws)
+        Hs, Ws = field_s.shape[2:]
+
+        # 归一化坐标系下的像素间距 (考虑了动态下采样的跨度)
         du = 2.0 / max(Ws - 1, 1)
         dv = 2.0 / max(Hs - 1, 1)
 
         # 归一化有限差分（雅可比元素）
-        dx_du = (field_s[:, 0, :, 1:] - field_s[:, 0, :, :-1]) / du   # (B,Hs,Ws-1)
+        dx_du = (field_s[:, 0, :, 1:] - field_s[:, 0, :, :-1]) / du  # (B,Hs,Ws-1)
         dy_du = (field_s[:, 1, :, 1:] - field_s[:, 1, :, :-1]) / du
-        dx_dv = (field_s[:, 0, 1:, :] - field_s[:, 0, :-1, :]) / dv   # (B,Hs-1,Ws)
+        dx_dv = (field_s[:, 0, 1:, :] - field_s[:, 0, :-1, :]) / dv  # (B,Hs-1,Ws)
         dy_dv = (field_s[:, 1, 1:, :] - field_s[:, 1, :-1, :]) / dv
 
         # 取公共区域 (Hs-1, Ws-1)
         det_J = dx_du[:, :-1, :] * dy_dv[:, :, :-1] \
-              - dx_dv[:, :, :-1] * dy_du[:, :-1, :]   # (B,Hs-1,Ws-1)
+                - dx_dv[:, :, :-1] * dy_du[:, :-1, :]  # (B,Hs-1,Ws-1)
 
         fold_loss = F.relu(-det_J + self.epsilon).mean()
         fold_mask = (det_J < 0).detach()
@@ -427,7 +425,7 @@ class CombinedFoldingPenalty(nn.Module):
         self.lambda_cp    = lambda_cp
         self.lambda_dense = lambda_dense
         self.cp_penalty   = _FoldingPenaltyCP(grid_size=grid_size, epsilon=epsilon)
-        self.dense_penalty = FoldingPenaltyDense(stride=dense_stride, epsilon=epsilon)
+        self.dense_penalty = FoldingPenaltyDense(epsilon=epsilon)
 
     def forward(
         self,
@@ -473,9 +471,9 @@ class BypassTPSEstimator(nn.Module):
         grid_size: int = 10,
         feat_channels: int = 128,
         hidden_ch: int = 48,
-        flow_map_size: int = 64,    # 期望的flow分辨率（仅用于文档，实际动态）
+        flow_map_size: int = 64,
         sigma_scale: float = 0.7,
-        delta_scale: float = 0.2,
+        delta_scale: float = 0.5,
         use_entropy: bool = True,
         use_cf_consistency: bool = True,
     ):
@@ -625,63 +623,75 @@ class BypassTPSEstimator(nn.Module):
             "cf_consistency": cf_cons_map,
         }
 
-# dense_match/flow_to_tps.py
 
 class TPSGridGenerator(nn.Module):
-    def __init__(self, grid_size: int, **kwargs): # 移除固定 H, W 传参
+    def __init__(self, grid_size: int, **kwargs):
         super().__init__()
         self.gs = grid_size
-        
-        # 1. 预计算源控制点 (保持不变)
-        y, x = torch.meshgrid(torch.linspace(-1, 1, grid_size), 
+
+        # 1. 控制点 (Control Points) 属于纯几何锚点
+        # 必须锚定在绝对边缘 [-1, 1]，以确保 TPS 能包裹整个图像域。
+        # 这里保留 linspace(-1, 1, grid_size) 是严谨且正确的。
+        y, x = torch.meshgrid(torch.linspace(-1, 1, grid_size),
                               torch.linspace(-1, 1, grid_size), indexing='ij')
-        p_src = torch.stack([x.reshape(-1), y.reshape(-1)], dim=1)
+        p_src = torch.stack([x.reshape(-1), y.reshape(-1)], dim=1)  # (N_cp, 2)
         self.register_buffer("p_src", p_src)
 
-        # 2. 预计算 L 逆矩阵 (只跟控制点数量有关，保持不变)
+        # 2. 预计算 L 逆矩阵 (Static)
         dist_cp = torch.cdist(p_src, p_src)
         K = self._tps_kernel(dist_cp)
-        P = torch.cat([torch.ones(grid_size**2, 1), p_src], dim=1)
-        L = torch.zeros(grid_size**2 + 3, grid_size**2 + 3)
-        L[:grid_size**2, :grid_size**2] = K
-        L[:grid_size**2, grid_size**2:] = P
-        L[grid_size**2:, :grid_size**2] = P.t()
+        P = torch.cat([torch.ones(grid_size ** 2, 1), p_src], dim=1)
+        L = torch.zeros(grid_size ** 2 + 3, grid_size ** 2 + 3)
+        L[:grid_size ** 2, :grid_size ** 2] = K
+        L[:grid_size ** 2, grid_size ** 2:] = P
+        L[grid_size ** 2:, :grid_size ** 2] = P.t()
+        # 增加微小偏置确保矩阵可逆
         self.register_buffer("L_inv", torch.inverse(L + torch.eye(L.shape[0]) * 1e-6))
 
+        # 3. 初始化缓存字典 (针对不同分辨率 H, W)
+        self._cache = {}
+
     def _tps_kernel(self, r):
-        r_sq = r**2
+        r_sq = r ** 2
         return r_sq * torch.log(r_sq + 1e-8)
 
     def forward(self, delta_cp: torch.Tensor, target_shape: Tuple[int, int]) -> torch.Tensor:
-        """
-        target_shape: (H, W) 当前 batch 图片的实际高度和宽度
-        """
         B = delta_cp.shape[0]
-        H, W = target_shape # 获取动态尺寸
+        H, W = target_shape
         device, dtype = delta_cp.device, delta_cp.dtype
-        
-        # 强制在 FP32 下计算核心矩阵运算防止 NaN
-        with torch.cuda.amp.autocast(enabled=False):
-            # 1. 计算 coeffs (保持不变)
+
+        # 缓存静态几何矩阵 (K_pix, P_pix)
+        key = (H, W, str(device), str(dtype))
+        if key not in self._cache:
+            # ==========================================================
+            # 核心修复区：像素中心对齐 (align_corners=False 规范)
+            # 彻底消除与 F.grid_sample 之间的半像素物理错位！
+            # ==========================================================
+            ys = (torch.arange(H, device=device, dtype=dtype) + 0.5) * (2.0 / H) - 1.0
+            xs = (torch.arange(W, device=device, dtype=dtype) + 0.5) * (2.0 / W) - 1.0
+            yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+
+            p_tgt_pix = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1)
+            dist_pix_cp = torch.cdist(p_tgt_pix, self.p_src)
+
+            K_pix = self._tps_kernel(dist_pix_cp)
+            P_pix = torch.cat([torch.ones(H * W, 1, device=device, dtype=dtype), p_tgt_pix], dim=1)
+            self._cache[key] = (K_pix, P_pix)
+
+        K_pix, P_pix = self._cache[key]
+
+        # 动态计算 TPS 系数 (每个 batch 都运行，强制 FP32 保证形变精度)
+        with torch.amp.autocast('cuda', enabled=False):
+            # 将 delta_cp 从 (B,2,gs,gs) 转为 (B,N_cp,2)
             p_delta = delta_cp.permute(0, 2, 3, 1).reshape(B, -1, 2).float()
             p_tgt_cp = self.p_src.unsqueeze(0) + p_delta
+
+            # 求解 L_inv * Y = coeffs
             Y = torch.cat([p_tgt_cp, torch.zeros(B, 3, 2, device=device)], dim=1)
-            coeffs = torch.matmul(self.L_inv, Y)
+            coeffs = torch.matmul(self.L_inv, Y)  # [B, gs^2+3, 2]
 
-            yy, xx = torch.meshgrid(
-                torch.linspace(-1, 1, H, device=device, dtype=dtype),
-                torch.linspace(-1, 1, W, device=device, dtype=dtype),
-                indexing='ij'
-            )
-            p_tgt_pix = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1) # (N_pix, 2)
+            # 映射网格
+            grid = torch.matmul(K_pix, coeffs[:, :self.gs ** 2, :]) + \
+                   torch.matmul(P_pix, coeffs[:, self.gs ** 2:, :])
 
-            # 3. 计算距离矩阵 (N_pix, N_cp)
-            dist_pix_cp = torch.cdist(p_tgt_pix, self.p_src)
-            K_pix = self._tps_kernel(dist_pix_cp)
-            
-            # 4. 映射坐标
-            P_pix = torch.cat([torch.ones(H * W, 1, device=device, dtype=dtype), p_tgt_pix], dim=1)
-            grid = torch.matmul(K_pix, coeffs[:, :self.gs**2, :]) + \
-                   torch.matmul(P_pix, coeffs[:, self.gs**2:, :])
-               
         return grid.reshape(B, H, W, 2).to(dtype)

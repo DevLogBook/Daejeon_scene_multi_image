@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 
-
+torch.set_float32_matmul_precision('highest')
 REPO_ROOT = Path(__file__).resolve().parent
 ROMA_SRC = REPO_ROOT / "RoMaV2" / "src"
 
@@ -30,10 +30,10 @@ project_root = REPO_ROOT.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 from dense_match.network import (
-    AgriTPSStitcher, 
-    DistillationLoss, 
+    AgriTPSStitcher,
+    DistillationLoss,
     LocalGeometricConsistency,
-    compute_photometric_loss, 
+    compute_photometric_loss,
     compute_cycle_consistency_loss,
     ssim_map,
     make_grid,
@@ -71,33 +71,39 @@ def ssim_loss(img1, img2, window_size=11):
     return 1 - ssim_n / (ssim_d + 1e-8)
 
 def compute_photometric_loss(img_a, img_b, dense_grid, confidence, alpha=0.85):
-    """SSIM + L1 混合光度损失"""
-    # 将 img_b 变换到 img_a 的坐标系
+    """
+    高精度光度损失：支持 512x512 细碎纹理对齐
+    """
+    B, C, H, W = img_a.shape
+    device = img_a.device
+
+    #  采样 warped 图 (跟随 dense_grid 的尺寸)
     warped_b = F.grid_sample(img_b, dense_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-    
-    l1_map = torch.abs(img_a - warped_b).mean(dim=1, keepdim=True)
-    ssim_map = ssim_loss(img_a, warped_b)
-    
-    photo_loss = alpha * ssim_map + (1 - alpha) * l1_map
-    # 使用置信度加权：confidence 可能来自 matcher 的 coarse/fine 分辨率，需要对齐到图像分辨率
-    if isinstance(confidence, torch.Tensor):
-        if confidence.ndim == 4 and confidence.shape[-1] == 1:
-            # (B,H,W,1) -> (B,H,W)
-            confidence = confidence[..., 0]
-        if confidence.ndim == 4 and confidence.shape[1] == 1:
-            # (B,1,H,W) -> (B,H,W)
-            confidence = confidence[:, 0]
-        if confidence.ndim != 3:
-            raise ValueError(f"confidence must be (B,H,W) (or broadcastable variants), got {confidence.shape}")
-        if confidence.shape[-2:] != photo_loss.shape[-2:]:
-            confidence = F.interpolate(
-                confidence.unsqueeze(1),
-                size=photo_loss.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
-    # (B,C,H,W) * (B,1,H,W) broadcast
-    return (photo_loss * confidence.unsqueeze(1)).sum() / (confidence.sum() + 1e-6)
+
+    target_hw = warped_b.shape[-2:]
+    if img_a.shape[-2:] != target_hw:
+        img_curr = F.interpolate(img_a, size=target_hw, mode='bilinear', align_corners=False)
+    else:
+        img_curr = img_a
+
+    # 生成有效重叠掩码 (Overlap Mask)
+    ones = torch.ones((B, 1, *target_hw), device=device, dtype=img_a.dtype)
+    mask = F.grid_sample(ones, dense_grid, mode='nearest', padding_mode='zeros', align_corners=False)
+    mask = (mask > 0.9).float()
+
+    l1_map = torch.abs(img_curr - warped_b).mean(dim=1, keepdim=True)
+
+    s_map = ssim_map(img_curr, warped_b, mask)
+    ssim_loss_map = 1 - s_map.mean(dim=1, keepdim=True)
+
+    photo_loss_map = alpha * ssim_loss_map + (1 - alpha) * l1_map
+
+    # 置信度对齐
+    if confidence.ndim == 3: confidence = confidence.unsqueeze(1)
+    conf = F.interpolate(confidence, size=target_hw, mode="bilinear") if confidence.shape[-2:] != target_hw else confidence
+
+    total_weight = conf * mask
+    return (photo_loss_map * total_weight).sum() / (total_weight.sum() + 1e-6)
 
 
 def _finite_stats(x: torch.Tensor) -> str:
@@ -202,6 +208,7 @@ def create_checkerboard(img1, img2, num_squares=8):
     创建棋盘格对比图，用于检查边缘缝合是否平滑连续
     """
     B, C, H, W = img1.shape
+    img2 = img2.to(img1.device)
     grid_h = H // num_squares
     grid_w = W // num_squares
     
@@ -212,64 +219,72 @@ def create_checkerboard(img1, img2, num_squares=8):
     return img1 * mask + img2 * (1 - mask)
 
 def colorize_heatmap(tensor, cmap='jet'):
-    """将 [1, H, W] 转换为彩色热力图 [3, H, W]"""
-    x = tensor.detach().cpu().numpy()[0]
-    color_map = cm.get_cmap(cmap)
-    colorized = color_map(x)[:, :, :3] # 取 RGB
+    x = tensor.detach().cpu().numpy().squeeze()
+
+    # 归一化到 0-1 确保颜色准确
+    x = (x - x.min()) / (x.max() - x.min() + 1e-8)
+
+    # 使用 plt.get_cmap 替代废弃的 cm.get_cmap
+    color_map = plt.get_cmap(cmap)
+
+    colorized = color_map(x)[..., :3]
+
     return torch.from_numpy(colorized).permute(2, 0, 1).float()
 
 def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
     """
-    全方位监控面板：对比原图、变换图、缝合效果及几何稳定性
+    第一行：A 原图 | B 原图 | Warped B (黑边填充) | 棋盘格拼接 (看对齐)
+    第二行：彩色置信度 (Red=High) | 误差图 (L1) | TPS 密集网格 | 最终融合图+网格
     """
     matcher_out = stu_out['matcher_out']
-    dense_grid = stu_out['dense_grid']
-    H, W = img_a.shape[-2:]
-
-    def denorm(x): 
-        # 恢复归一化图像用于显示 (假设使用了 ImageNet 标准差)
+    dense_grid = stu_out['dense_grid']  # [B, H, W, 2]
+    device = img_a.device
+    H_target, W_target = dense_grid.shape[1:3]
+    def denorm(x):
         return (x[0:1].detach().cpu() * 0.225 + 0.45).clamp(0, 1)
 
+    def process_for_vis(x, target_hw=None):
+        if target_hw and x.shape[-2:] != target_hw:
+            x = F.interpolate(x, size=target_hw, mode='bilinear', align_corners=False)
+        # 取 batch 第一个样本，去归一化，转 CPU
+        return (x[0:1].detach() * 0.225 + 0.45).clamp(0, 1).cpu()
+
     with torch.no_grad():
-        # 基础图像准备
-        img_a_dn = denorm(img_a)      # [1, 3, H, W]
-        img_b_dn = denorm(img_b)      # [1, 3, H, W]
-        # 对 img_b 进行 TPS 变换
-        warped_b = F.grid_sample(img_b, dense_grid, padding_mode='zeros', align_corners=False)
-        warped_b_dn = denorm(warped_b)
+        # 采样并生成所有图像
+        warped_b = F.grid_sample(img_b, dense_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
 
-        # 效果评估图
-        # A. 混合缝合图 (Alpha Blending) - 观察是否有重影 (Ghosting)
-        blended_vis = (img_a_dn * 0.5 + warped_b_dn * 0.5)
+        # 生成所有可视化张量，确保都在 CPU 且尺寸一致 (H_target, W_target)
+        img_a_vis = process_for_vis(img_a, (H_target, W_target))
+        img_b_vis = process_for_vis(img_b, (H_target, W_target))
+        warped_b_vis = process_for_vis(warped_b)  # 已经是目标尺寸
 
-        # B. 棋盘格拼接 (Checkerboard) - 检查边缘纹理连续性
-        grid_h, grid_w = H // 8, W // 8
-        yy, xx = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
-        m = ((yy // grid_h) % 2 == (xx // grid_w) % 2).float().to(img_a_dn.device)
-        checker_vis = img_a_dn * m + warped_b_dn * (1 - m)
+        # 缝合效果与掩码
+        ones = torch.ones((1, 1, H_target, W_target), device=device)
+        mask = F.grid_sample(ones, dense_grid[0:1], mode='nearest', padding_mode='zeros', align_corners=False).cpu()
+        mask = (mask > 0.9).float()
 
-        # C. 误差图 (L1 Difference) - 越黑代表对齐越准
-        diff_vis = (img_a_dn - warped_b_dn).abs().mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+        checker_vis = create_checkerboard(img_a_vis, warped_b_vis, num_squares=12)
+        diff_vis = (img_a_vis - warped_b_vis).abs().mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+        blended_vis = img_a_vis * (1 - mask * 0.5) + warped_b_vis * (mask * 0.5)
 
-        # 几何信号图
-        # 彩色置信度 (Jet: 红色=极高，蓝色=极低)
-        conf = matcher_out['confidence_AB'][0:1].detach().cpu()
-        conf_up = F.interpolate(conf.unsqueeze(1), size=(H, W), mode='bilinear')[0]
-        conf_color = colorize_heatmap(conf_up, cmap='jet')
+        # 几何信号处理
+        conf = matcher_out['confidence_AB'][0:1].detach()
+        if conf.shape[-2:] != (H_target, W_target):
+            conf = F.interpolate(conf.unsqueeze(1), size=(H_target, W_target), mode='bilinear')[0]
+        else:
+            conf = conf[0]
+        conf_color = colorize_heatmap(conf.cpu().unsqueeze(0), cmap='jet')
 
-        # TPS 网格图
-        grid_vis = plot_grid_to_image(dense_grid, (H, W)) # 之前写的绘图函数
-        # 网格叠加在混合图上，看形变逻辑是否符合图像特征
+        # 网格图绘制
+        grid_vis = plot_grid_to_image(dense_grid, (H_target, W_target))
         overlay_vis = blended_vis[0] * 0.7 + grid_vis * 0.3
 
-        # 拼接看板 (2 行 x 4 列)
-        # 每张图都是 [3, H, W]
-        row1 = torch.cat([img_a_dn[0], img_b_dn[0], warped_b_dn[0], blended_vis[0]], dim=2)
-        row2 = torch.cat([checker_vis[0], diff_vis[0], conf_color, overlay_vis], dim=2)
-        
-        dashboard = torch.cat([row1, row2], dim=1) # [3, H*2, W*4]
-        
-        writer.add_image(f"{phase}/Full_Stitching_Dashboard", dashboard, step)
+        # 组装面板 (全部都在 CPU，尺寸均为 H_target x W_target)
+        row1 = torch.cat([img_a_vis[0], img_b_vis[0], warped_b_vis[0], checker_vis[0]], dim=2)
+        row2 = torch.cat([conf_color, diff_vis[0], grid_vis, overlay_vis], dim=2)
+        dashboard = torch.cat([row1, row2], dim=1)
+
+        writer.add_image(f"{phase}/Full_Dashboard", dashboard, step)
 
 # EMA Loss Tracker
 class EMALossTracker:
@@ -295,39 +310,13 @@ class EMALossTracker:
         return self.ema_values.get(name, float('inf'))
 
 
-def multi_scale_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """多尺度 collate：同一 batch 内 resize 到第一个样本的尺寸"""
+def multi_scale_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, List[torch.Tensor]]:
     if len(batch) == 0:
         return {}
-    
-    first_img = batch[0]['img_a']
-    target_h, target_w = first_img.shape[1], first_img.shape[2]
-    
-    img_a_list = []
-    img_b_list = []
-    
-    for item in batch:
-        img_a = item['img_a']
-        img_b = item['img_b']
-        
-        _, h, w = img_a.shape
-        
-        if h != target_h or w != target_w:
-            img_a = F.interpolate(
-                img_a.unsqueeze(0), size=(target_h, target_w),
-                mode='bilinear', align_corners=False
-            ).squeeze(0)
-            img_b = F.interpolate(
-                img_b.unsqueeze(0), size=(target_h, target_w),
-                mode='bilinear', align_corners=False
-            ).squeeze(0)
-        
-        img_a_list.append(img_a)
-        img_b_list.append(img_b)
-    
+
     return {
-        'img_a': torch.stack(img_a_list, dim=0),
-        'img_b': torch.stack(img_b_list, dim=0),
+        'img_a': [item['img_a'] for item in batch],
+        'img_b': [item['img_b'] for item in batch],
     }
 
 
@@ -533,17 +522,18 @@ def validate(student, teacher, val_loader, loss_fn, device, teacher_grid_size, m
         )
         total_distill_loss += d_loss['total'].item()
 
-        # 计算 SSIM
-        warped_b = F.grid_sample(img_b, stu_out['dense_grid'], align_corners=False, padding_mode='zeros')
-        s_map = ssim_map(img_a, warped_b) 
-        total_ssim += s_map.mean().item()
+        # # 计算 SSIM
+        # warped_b = F.grid_sample(img_b, stu_out['dense_grid'], align_corners=False, padding_mode='zeros')
+        #
+        # s_map = ssim_map_v2(img_a, warped_b)
+        # total_ssim += s_map.mean().item()
         total_fold += stu_out['tps_out'].get('fold_ratio', 0)
         count += 1
     
     student.train()
     return {
-        "total": total_distill_loss / count, # 这样 best_val_loss 才有意义
-        "ssim": total_ssim / count,
+        "total": total_distill_loss / count,
+        # "ssim": total_ssim / count,
         "fold_ratio": total_fold / count
     }
 
@@ -595,29 +585,65 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 def get_phase_config(epoch):
-    if epoch <= 10:
-        return {
-            "phase": "DISTILL",
-            "weights": {"distill": 1.0, "fold": 0.0, "photo": 0.0, "cycle": 0.0, "geo": 0.5},
-            "train_aggregator": False,
-            "train_matcher": True
-        }
-    elif epoch <= 15:
-        return {
-            "phase": "TPS_REFINE",
-            # 开启 TPS，但折叠惩罚要给足，防止形变失控
-            "weights": {"distill": 0.5, "fold": 1.5, "photo": 0.5, "cycle": 0.0, "geo": 1.0},
-            "train_aggregator": True,
-            "train_matcher": False
-        }
+    keyframes = {
+        1: {"phase": "DISTILL", "w": {"distill": 1.0, "fold": 0.0, "photo": 0.5, "cycle": 0.0, "geo": 0.1, "homo": 0.5},
+            "train_aggregator": False},
+        8: {"phase": "DISTILL", "w": {"distill": 1.0, "fold": 0.0, "photo": 0.5, "cycle": 0.0, "geo": 0.1, "homo": 0.5},
+            "train_aggregator": False},
+        10: {"phase": "TPS_REFINE",
+             "w": {"distill": 0.5, "fold": 2.0, "photo": 1.0, "cycle": 0.0, "geo": 1.0, "homo": 0.2},
+             "train_aggregator": True},
+        15: {"phase": "TPS_REFINE",
+             "w": {"distill": 0.5, "fold": 2.0, "photo": 1.0, "cycle": 0.0, "geo": 1.0, "homo": 0.2},
+             "train_aggregator": True},
+        17: {"phase": "SELF_SUPERVISED",
+             "w": {"distill": 0.1, "fold": 5.0, "photo": 2.0, "cycle": 1.0, "geo": 3.0, "homo": 0.1},
+             "train_aggregator": True},
+        100: {"phase": "SELF_SUPERVISED",
+              "w": {"distill": 0.1, "fold": 5.0, "photo": 2.0, "cycle": 1.0, "geo": 3.0, "homo": 0.1},
+              "train_aggregator": True},
+    }
+
+    # 定位当前 Epoch 所在的插值区间 [e1, e2]
+    epochs = sorted(keyframes.keys())
+    e1, e2 = epochs[0], epochs[-1]
+    for i in range(len(epochs) - 1):
+        if epochs[i] <= epoch <= epochs[i + 1]:
+            e1, e2 = epochs[i], epochs[i + 1]
+            break
+
+    if epoch >= epochs[-1]:
+        e1 = e2 = epochs[-1]
+
+    kf1, kf2 = keyframes[e1], keyframes[e2]
+
+    # 计算插值系数 alpha (0.0 到 1.0)
+    alpha = 0.0 if e1 == e2 else (epoch - e1) / (e2 - e1)
+
+    # 线性平滑混合权重
+    blended_weights = {
+        k: (1 - alpha) * kf1["w"][k] + alpha * kf2["w"][k]
+        for k in kf1["w"]
+    }
+
+    # 状态平滑切换
+    # 只要开始向新阶段过渡(alpha > 0)，就立刻解冻对应的网络层，使其提前开始适应微小的梯度
+    train_aggregator = kf2["train_aggregator"] if alpha > 0 else kf1["train_aggregator"]
+
+    # 动态生成 Phase 监控名称
+    if alpha == 0:
+        phase_name = kf1["phase"]
+    elif alpha == 1:
+        phase_name = kf2["phase"]
     else:
-        return {
-            "phase": "SELF_SUPERVISED",
-            # 自监督为主，降低蒸馏权重
-            "weights": {"distill": 0.2, "fold": 3.0, "photo": 2.0, "cycle": 1.0, "geo": 0.8},
-            "train_aggregator": True,
-            "train_matcher": True
-        }
+        phase_name = f"TRANSITION ({kf1['phase']} -> {kf2['phase']})"
+
+    return {
+        "phase": phase_name,
+        "weights": blended_weights,
+        "train_aggregator": train_aggregator,
+        "train_matcher": True
+    }
 
 # 主函数
 def main() -> None:
@@ -730,8 +756,24 @@ def main() -> None:
         student.matcher.backbone.eval()
 
         for i, batch in enumerate(train_loader):
-            img_a = batch["img_a"].to(device, non_blocking=True)
-            img_b = batch["img_b"].to(device, non_blocking=True)
+            img_a_list = [x.to(device, non_blocking=True) for x in batch["img_a"]]
+            img_b_list = [x.to(device, non_blocking=True) for x in batch["img_b"]]
+
+            target_h, target_w = img_a_list[0].shape[-2:]
+            B = len(img_a_list)
+
+            img_a = torch.empty((B, 3, target_h, target_w), device=device, dtype=img_a_list[0].dtype)
+            img_b = torch.empty((B, 3, target_h, target_w), device=device, dtype=img_b_list[0].dtype)
+
+            for b_idx, (a, b) in enumerate(zip(img_a_list, img_b_list)):
+                if a.shape[-2:] != (target_h, target_w):
+                    img_a[b_idx] = F.interpolate(a.unsqueeze(0), size=(target_h, target_w), mode='bilinear',
+                                                 align_corners=False).squeeze(0)
+                    img_b[b_idx] = F.interpolate(b.unsqueeze(0), size=(target_h, target_w), mode='bilinear',
+                                                 align_corners=False).squeeze(0)
+                else:
+                    img_a[b_idx] = a
+                    img_b[b_idx] = b
 
             # input sanity
             if not torch.isfinite(img_a).all().item():
@@ -769,10 +811,26 @@ def main() -> None:
                     )
 
                     if cfg["phase"] == "SELF_SUPERVISED":
-                        stu_out_ba = student(img_b, img_a)
+                        # 不对称特征扰动，给逆向过程 (B->A) 的图像注入高斯噪声或微小亮度偏移。强迫网络依靠高维语义和几何结构去匹配，而不是死记硬背像素值。
+                        noise_std = 0.02
+                        noise_b = torch.randn_like(img_b) * noise_std
+                        noise_a = torch.randn_like(img_a) * noise_std
+
+                        # 注入噪声并裁剪回合理区间
+                        b_min, b_max = img_b.min(), img_b.max()
+                        a_min, a_max = img_a.min(), img_a.max()
+
+                        img_b_noisy = (img_b + noise_b).clamp(b_min, b_max)
+                        img_a_noisy = (img_a + noise_a).clamp(a_min, a_max)
+
+                        # 使用带噪声的图像进行逆向推理
+                        stu_out_ba = student(img_b_noisy, img_a_noisy)
+
                         c_loss = compute_cycle_consistency_loss(stu_out, stu_out_ba)
                     else:
                         c_loss = torch.tensor(0.0, device=device)
+
+                    h_loss = torch.norm(stu_out.get('H_mat', torch.eye(3).to(device)) - torch.eye(3).to(device))
 
                     w = cfg["weights"]
                     total_loss = (
@@ -781,6 +839,7 @@ def main() -> None:
                         + w["photo"] * p_loss
                         + w["cycle"] * c_loss
                         + w["geo"] * geo_loss
+                        + w.get("homo", 0.1) * h_loss
                     )
                 return stu_out, d_loss, f_loss, p_loss, c_loss, geo_loss, total_loss
 
@@ -815,7 +874,7 @@ def main() -> None:
                 # AMP fallback: rerun this batch in fp32 once; if it becomes finite, disable AMP for stability.
                 if use_amp:
                     print("[NaN/Inf] Detected under AMP. Retrying this batch with AMP disabled...")
-                    stu_out, d_loss, f_loss, p_loss, c_loss, total_loss = _forward_losses(False)
+                    stu_out, d_loss, f_loss, p_loss, c_loss, geo_loss, total_loss = _forward_losses(False)
                     ok2 = True
                     ok2 &= _check_finite("fp32/loss/total", total_loss)
                     if ok2:
