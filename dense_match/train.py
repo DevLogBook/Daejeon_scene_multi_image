@@ -33,12 +33,14 @@ from dense_match.network import (
     AgriTPSStitcher,
     DistillationLoss,
     LocalGeometricConsistency,
+    make_grid,
+)
+from dense_match.refine import (
     compute_photometric_loss,
     compute_cycle_consistency_loss,
-    ssim_map,
-    make_grid,
-    )
-from dataset.dataset import MultiScaleDataset
+)
+
+from dataset.dataset import MultiScaleDataset, CachedTeacherDataset
 
 if str(ROMA_SRC) not in sys.path:
     sys.path.insert(0, str(ROMA_SRC))
@@ -50,60 +52,6 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-def ssim_loss(img1, img2, window_size=11):
-    """计算 SSIM Loss Map"""
-    C = img1.shape[1]
-    window = torch.ones((C, 1, window_size, window_size), device=img1.device) / (window_size**2)
-    
-    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=C)
-    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=C)
-    
-    mu1_sq, mu2_sq, mu1_mu2 = mu1.pow(2), mu2.pow(2), mu1 * mu2
-    
-    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=C) - mu1_sq
-    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=C) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=C) - mu1_mu2
-    
-    C1, C2 = 0.01**2, 0.03**2
-    ssim_n = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
-    ssim_d = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
-    return 1 - ssim_n / (ssim_d + 1e-8)
-
-def compute_photometric_loss(img_a, img_b, dense_grid, confidence, alpha=0.85):
-    """
-    高精度光度损失：支持 512x512 细碎纹理对齐
-    """
-    B, C, H, W = img_a.shape
-    device = img_a.device
-
-    #  采样 warped 图 (跟随 dense_grid 的尺寸)
-    warped_b = F.grid_sample(img_b, dense_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-
-    target_hw = warped_b.shape[-2:]
-    if img_a.shape[-2:] != target_hw:
-        img_curr = F.interpolate(img_a, size=target_hw, mode='bilinear', align_corners=False)
-    else:
-        img_curr = img_a
-
-    # 生成有效重叠掩码 (Overlap Mask)
-    ones = torch.ones((B, 1, *target_hw), device=device, dtype=img_a.dtype)
-    mask = F.grid_sample(ones, dense_grid, mode='nearest', padding_mode='zeros', align_corners=False)
-    mask = (mask > 0.9).float()
-
-    l1_map = torch.abs(img_curr - warped_b).mean(dim=1, keepdim=True)
-
-    s_map = ssim_map(img_curr, warped_b, mask)
-    ssim_loss_map = 1 - s_map.mean(dim=1, keepdim=True)
-
-    photo_loss_map = alpha * ssim_loss_map + (1 - alpha) * l1_map
-
-    # 置信度对齐
-    if confidence.ndim == 3: confidence = confidence.unsqueeze(1)
-    conf = F.interpolate(confidence, size=target_hw, mode="bilinear") if confidence.shape[-2:] != target_hw else confidence
-
-    total_weight = conf * mask
-    return (photo_loss_map * total_weight).sum() / (total_weight.sum() + 1e-6)
 
 
 def _finite_stats(x: torch.Tensor) -> str:
@@ -126,6 +74,7 @@ def _check_finite(name: str, x: torch.Tensor) -> bool:
         print(f"[NaN/Inf] {name}: bad={bad} {_finite_stats(x)}")
     return bool(ok)
 
+
 def plot_grid_to_image(dense_grid, img_shape):
     """
     像素级对齐绘图：确保 [-1, 1] 完美对应到 [0, H/W]
@@ -133,31 +82,31 @@ def plot_grid_to_image(dense_grid, img_shape):
     H, W = img_shape
     # grid 形状: [H, W, 2], 范围 [-1, 1]
     grid = dense_grid[0].detach().cpu().numpy()
-    
+
     # 核心映射：将 [-1, 1] 线性映射到 [0, W-1] 和 [0, H-1]
     # x 坐标映射到宽度，y 坐标映射到高度
     grid_px = (grid + 1.0) / 2.0 * np.array([W - 1, H - 1])
-    
+
     # 创建纯黑背景（之后会与原图叠加，这里用 0 填充）
     canvas = np.zeros((H, W, 3), dtype=np.uint8)
-    
+
     # 设置网格密度（例如每隔 32 像素画一根线）
     step_h = max(H // 16, 1)
     step_w = max(W // 16, 1)
-    
-    color = (0, 0, 255) # 红色 (BGR 格式)
+
+    color = (0, 0, 255)  # 红色 (BGR 格式)
     thickness = 2
 
     # 绘制水平线 (Horizontal lines)
     for i in range(0, H, step_h):
         pts = grid_px[i, :, :].astype(np.int32)
         cv2.polylines(canvas, [pts], isClosed=False, color=color, thickness=thickness)
-    
+
     # 绘制垂直线 (Vertical lines)
     for j in range(0, W, step_w):
         pts = grid_px[:, j, :].astype(np.int32)
         cv2.polylines(canvas, [pts], isClosed=False, color=color, thickness=thickness)
-    
+
     # 绘制最外层边界线，确保“四个角贴死”
     border_idx = [0, -1]
     for b in border_idx:
@@ -166,42 +115,23 @@ def plot_grid_to_image(dense_grid, img_shape):
 
     return torch.from_numpy(canvas).permute(2, 0, 1).float() / 255.0
 
-def plot_grid_to_tensorboard(dense_grid, img_shape, step, writer, tag="Train/TPS_Grid"):
-    """
-    将 TPS 产生的密集网格绘制成线图，反映变形程度
-    dense_grid: (1, H, W, 2) 范围 [-1, 1]
-    """
+
+def plot_grid_to_tensorboard(dense_grid, img_shape, step, writer, tag='Train/TPS_Grid'):
     B, H, W, _ = dense_grid.shape
-    grid = dense_grid[0].detach().cpu().numpy() # 取第一个样本 (H, W, 2)
-    
-    # 创建 matplotlib 画布
-    fig, ax = plt.subplots(figsize=(6, 6))
-    
-    # 为了清晰，每隔 16 个像素画一根线
+    grid = dense_grid[0].detach().cpu().numpy()
     step_size = max(H // 32, 1)
-    
-    # 绘制水平线
+    fig, ax = plt.subplots(figsize=(6, 6))
     for i in range(0, H, step_size):
         ax.plot(grid[i, :, 0], grid[i, :, 1], color='blue', linewidth=0.5)
-    # 绘制垂直线
     for j in range(0, W, step_size):
         ax.plot(grid[:, j, 0], grid[:, j, 1], color='blue', linewidth=0.5)
-    
-    ax.set_xlim(-1, 1)
-    ax.set_ylim(1, -1) # 反转 Y 轴匹配图片坐标系
-    ax.set_aspect('equal')
+    ax.set_xlim(-1, 1);
+    ax.set_ylim(1, -1);
+    ax.set_aspect('equal');
     ax.axis('off')
-    
-    # 将 plot 转换为 Tensor
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+    writer.add_figure(tag, fig, step)
     plt.close(fig)
-    buf.seek(0)
-    
-    image = cv2.imdecode(np.frombuffer(buf.getvalue(), dtype=np.uint8), cv2.IMREAD_COLOR)
-    image = torch.from_numpy(image).permute(2, 0, 1) # (3, H, W)
-    
-    writer.add_image(tag, image, step)
+
 
 def create_checkerboard(img1, img2, num_squares=8):
     """
@@ -211,12 +141,13 @@ def create_checkerboard(img1, img2, num_squares=8):
     img2 = img2.to(img1.device)
     grid_h = H // num_squares
     grid_w = W // num_squares
-    
+
     # 创建掩码
     y, x = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
     mask = ((y // grid_h) % 2 == (x // grid_w) % 2).float().to(img1.device)
-    
+
     return img1 * mask + img2 * (1 - mask)
+
 
 def colorize_heatmap(tensor, cmap='jet'):
     x = tensor.detach().cpu().numpy().squeeze()
@@ -231,6 +162,7 @@ def colorize_heatmap(tensor, cmap='jet'):
 
     return torch.from_numpy(colorized).permute(2, 0, 1).float()
 
+
 def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
     """
     第一行：A 原图 | B 原图 | Warped B (黑边填充) | 棋盘格拼接 (看对齐)
@@ -240,6 +172,7 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
     dense_grid = stu_out['dense_grid']  # [B, H, W, 2]
     device = img_a.device
     H_target, W_target = dense_grid.shape[1:3]
+
     def denorm(x):
         return (x[0:1].detach().cpu() * 0.225 + 0.45).clamp(0, 1)
 
@@ -270,7 +203,7 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
         # 几何信号处理
         conf = matcher_out['confidence_AB'][0:1].detach()
         if conf.shape[-2:] != (H_target, W_target):
-            conf = F.interpolate(conf.unsqueeze(1), size=(H_target, W_target), mode='bilinear')[0]
+            conf = F.interpolate(conf.unsqueeze(1), size=(H_target, W_target), mode='bilinear', align_corners=False)[0]
         else:
             conf = conf[0]
         conf_color = colorize_heatmap(conf.cpu().unsqueeze(0), cmap='jet')
@@ -286,13 +219,14 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
 
         writer.add_image(f"{phase}/Full_Dashboard", dashboard, step)
 
+
 # EMA Loss Tracker
 class EMALossTracker:
     def __init__(self, alpha: float = 0.1, window_size: int = 100):
         self.alpha = alpha
         self.ema_values: Dict[str, float] = {}
         self.windows: Dict[str, deque] = {}
-    
+
     def update(self, losses: Dict[str, float]) -> Dict[str, float]:
         smoothed = {}
         for name, value in losses.items():
@@ -305,7 +239,7 @@ class EMALossTracker:
             self.windows[name].append(value)
             smoothed[f"{name}_ema"] = self.ema_values[name]
         return smoothed
-    
+
     def get_ema(self, name: str) -> float:
         return self.ema_values.get(name, float('inf'))
 
@@ -320,6 +254,24 @@ def multi_scale_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, Li
     }
 
 
+def cached_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """
+    CachedTeacherDataset 专用 collate。
+    每个样本的空间尺寸已在预计算时固定，可以直接 stack。
+    teacher 信号同样一起 stack，免去训练循环内的手动拼装。
+    """
+    if len(batch) == 0:
+        return {}
+    return {
+        'img_a': torch.stack([item['img_a'] for item in batch]),
+        'img_b': torch.stack([item['img_b'] for item in batch]),
+        't_warp_AB': torch.stack([item['t_warp_AB'] for item in batch]),
+        't_conf_AB': torch.stack([item['t_conf_AB'] for item in batch]),
+        't_feat_a': torch.stack([item['t_feat_a'] for item in batch]),
+        't_feat_b': torch.stack([item['t_feat_b'] for item in batch]),
+    }
+
+
 # 辅助函数
 def teacher_overlap_map(confidence: torch.Tensor) -> torch.Tensor:
     if confidence.ndim == 4:
@@ -330,9 +282,9 @@ def teacher_overlap_map(confidence: torch.Tensor) -> torch.Tensor:
 
 
 def make_teacher_inputs(
-    img_a: torch.Tensor,
-    img_b: torch.Tensor,
-    teacher: Any,
+        img_a: torch.Tensor,
+        img_b: torch.Tensor,
+        teacher: Any,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     img_a_lr = F.interpolate(
         img_a, size=(teacher.H_lr, teacher.W_lr),
@@ -342,10 +294,10 @@ def make_teacher_inputs(
         img_b, size=(teacher.H_lr, teacher.W_lr),
         mode="bicubic", align_corners=False, antialias=True,
     )
-    
+
     if teacher.H_hr is None or teacher.W_hr is None:
         return img_a_lr, img_b_lr, None, None
-    
+
     img_a_hr = F.interpolate(
         img_a, size=(teacher.H_hr, teacher.W_hr),
         mode="bicubic", align_corners=False, antialias=True,
@@ -359,15 +311,15 @@ def make_teacher_inputs(
 
 @torch.no_grad()
 def extract_teacher_features_ds(
-    teacher: Any,
-    img_a_lr: torch.Tensor,
-    img_b_lr: torch.Tensor,
-    grid_size: int,
+        teacher: Any,
+        img_a_lr: torch.Tensor,
+        img_b_lr: torch.Tensor,
+        grid_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """提取 teacher 特征并下采样到指定尺寸"""
     f_list_a = teacher.f(img_a_lr)
     f_list_b = teacher.f(img_b_lr)
-    
+
     if f_list_a[0].shape[1] < f_list_a[0].shape[-1]:
         feat_a = torch.cat([x.float() for x in f_list_a], dim=1)
         feat_b = torch.cat([x.float() for x in f_list_b], dim=1)
@@ -388,7 +340,7 @@ def extract_teacher_features_ds(
             feat_b.permute(0, 3, 1, 2), size=(grid_size, grid_size),
             mode="bilinear", align_corners=False
         ).permute(0, 2, 3, 1)
-    
+
     bsz = feat_a_ds.shape[0]
     teacher_dim = feat_a_ds.shape[-1]
     feat_a_flat = feat_a_ds.reshape(bsz, grid_size * grid_size, teacher_dim)
@@ -398,21 +350,21 @@ def extract_teacher_features_ds(
 
 # Checkpoint
 def save_checkpoint(
-    save_dir: Path,
-    epoch: int,
-    step: int,
-    student: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    scaler: Optional[torch.amp.GradScaler],
-    args: argparse.Namespace,
-    train_loss_ema: float,
-    val_loss: float,
-    best_val_loss: float,
-    is_best: bool = False,
+        save_dir: Path,
+        epoch: int,
+        step: int,
+        student: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler,
+        scaler: Optional[torch.amp.GradScaler],
+        args: argparse.Namespace,
+        train_loss_ema: float,
+        val_loss: float,
+        best_val_loss: float,
+        is_best: bool = False,
 ) -> Path:
     save_dir.mkdir(parents=True, exist_ok=True)
-    
+
     payload = {
         "epoch": epoch,
         "step": step,
@@ -426,28 +378,28 @@ def save_checkpoint(
     }
     if scaler is not None:
         payload["scaler"] = scaler.state_dict()
-    
+
     last_path = save_dir / "last.pt"
     torch.save(payload, last_path)
     print(f"The last weight file update ! val loss: {val_loss:.6f} best val loss: {best_val_loss:.6f}")
-    
+
     if is_best:
         shutil.copyfile(last_path, save_dir / "best.pt")
         print(f"✅ New best val_loss: {val_loss:.6f}")
-    
+
     return last_path
 
 
 def load_checkpoint(
-    ckpt_path: Path,
-    student: nn.Module,
-    optimizer: Optional[torch.optim.Optimizer],
-    scheduler,
-    scaler: Optional[torch.amp.GradScaler],
-    device: torch.device,
+        ckpt_path: Path,
+        student: nn.Module,
+        optimizer: Optional[torch.optim.Optimizer],
+        scheduler,
+        scaler: Optional[torch.amp.GradScaler],
+        device: torch.device,
 ) -> Tuple[int, int, float, float]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    
+
     # 加载模型（处理可能的 key 不匹配）
     try:
         student.load_state_dict(ckpt["student"], strict=True)
@@ -457,7 +409,7 @@ def load_checkpoint(
         # 尝试非严格加载
         missing, unexpected = student.load_state_dict(ckpt["student"], strict=False)
         print(f"[load] Loaded with missing={len(missing)}, unexpected={len(unexpected)}")
-    
+
     # 尝试加载 optimizer
     if optimizer is not None and "optimizer" in ckpt:
         try:
@@ -465,7 +417,7 @@ def load_checkpoint(
             print("[load] ✅ Optimizer loaded")
         except Exception as e:
             print(f"[load] ⚠️ Optimizer load failed: {e}")
-    
+
     # 尝试加载 scheduler
     if scheduler is not None and ckpt.get("scheduler"):
         try:
@@ -473,17 +425,17 @@ def load_checkpoint(
             print("[load] ✅ Scheduler loaded")
         except Exception as e:
             print(f"[load] ⚠️ Scheduler load failed: {e}")
-    
+
     # 尝试加载 scaler
     if scaler is not None and "scaler" in ckpt:
         try:
             scaler.load_state_dict(ckpt["scaler"])
         except Exception as e:
             print(f"[load] ⚠️ Scaler load failed: {e}")
-    
+
     best_val_loss = ckpt.get("best_val_loss", ckpt.get("best_loss", float("inf")))
     train_loss_ema = ckpt.get("train_loss_ema", float("inf"))
-    
+
     return (
         int(ckpt.get("epoch", 0)),
         int(ckpt.get("step", 0)),
@@ -495,63 +447,74 @@ def load_checkpoint(
 @torch.no_grad()
 def validate(student, teacher, val_loader, loss_fn, device, teacher_grid_size, max_batches=20):
     student.eval()
-    total_ssim = 0
     total_fold = 0
     total_distill_loss = 0
     count = 0
-    
-    for i, batch in enumerate(val_loader):
-        if i >= max_batches: break
-        img_a = batch["img_a"].to(device)
-        img_b = batch["img_b"].to(device)
 
-        # 获取 Teacher 信号用于评估
-        img_a_lr, img_b_lr, img_a_hr, img_b_hr = make_teacher_inputs(img_a, img_b, teacher)
-        t_out = teacher(img_a_lr, img_b_lr, img_a_hr, img_b_hr)
-        t_feat_a, t_feat_b = extract_teacher_features_ds(teacher, img_a_lr, img_b_lr, teacher_grid_size)
+    for i, batch in enumerate(val_loader):
+        if i >= max_batches:
+            break
+
+        # 兼容两种 DataLoader：CachedTeacherDataset（tensor）和 MultiScaleDataset（list）
+        if isinstance(batch['img_a'], torch.Tensor):
+            img_a = batch['img_a'].to(device)
+            img_b = batch['img_b'].to(device)
+        else:
+            img_a = torch.stack(batch['img_a']).to(device)
+            img_b = torch.stack(batch['img_b']).to(device)
+
+        # 从缓存或实时推理获取 teacher 信号
+        if 't_warp_AB' in batch:
+            t_warp_AB = batch['t_warp_AB'].to(device)
+            t_conf_AB = batch['t_conf_AB'].to(device)
+            t_feat_a = batch['t_feat_a'].to(device)
+            t_feat_b = batch['t_feat_b'].to(device)
+            t_out = {'warp_AB': t_warp_AB, 'confidence_AB': t_conf_AB}
+        else:
+            with torch.inference_mode():
+                img_a_lr, img_b_lr, img_a_hr, img_b_hr = make_teacher_inputs(img_a, img_b, teacher)
+                t_out = teacher(img_a_lr, img_b_lr, img_a_hr, img_b_hr)
+                t_feat_a, t_feat_b = extract_teacher_features_ds(
+                    teacher, img_a_lr, img_b_lr, teacher_grid_size
+                )
 
         stu_out = student(img_a, img_b)
-        
-        # 计算蒸馏 Loss
+
         d_loss = loss_fn(
             stu_output=stu_out['matcher_out'],
-            teacher_warp=t_out["warp_AB"],
-            teacher_conf=teacher_overlap_map(t_out["confidence_AB"]),
+            teacher_warp=t_out['warp_AB'],
+            teacher_conf=teacher_overlap_map(t_out['confidence_AB']),
             teacher_feat_A=t_feat_a,
-            teacher_feat_B=t_feat_b
+            teacher_feat_B=t_feat_b,
         )
         total_distill_loss += d_loss['total'].item()
-
-        # # 计算 SSIM
-        # warped_b = F.grid_sample(img_b, stu_out['dense_grid'], align_corners=False, padding_mode='zeros')
-        #
-        # s_map = ssim_map_v2(img_a, warped_b)
-        # total_ssim += s_map.mean().item()
         total_fold += stu_out['tps_out'].get('fold_ratio', 0)
         count += 1
-    
+
     student.train()
     return {
-        "total": total_distill_loss / count,
-        # "ssim": total_ssim / count,
-        "fold_ratio": total_fold / count
+        'total': total_distill_loss / count,
+        'fold_ratio': total_fold / count,
     }
 
 
 # 参数解析
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("AgriMatcher Multi-Scale Training")
-    
-    p.add_argument("--pairs-file", type=Path, required=True)
+
+    p.add_argument("--pairs-file", type=Path, default=None,
+                   help="原始图像对文件（不使用 --cache-dir 时必填）")
+    p.add_argument("--cache-dir", type=Path, default=None,
+                   help="预计算 teacher 缓存目录（与 --pairs-file 二选一，优先使用缓存）")
     p.add_argument("--val-ratio", type=float, default=0.1)
     p.add_argument("--save-dir", type=Path, default=Path("checkpoints_multiscale"))
     p.add_argument("--log-dir", type=Path, default=Path("runs/agrimatch_multiscale"))
     p.add_argument("--resume", type=Path, default=None)
-    
+
     p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--teacher-dim", type=int, default=None)
     p.add_argument("--teacher-grid-size", type=int, default=32, help="Teacher 特征提取的 grid size")
-    
+
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--num-workers", type=int, default=4)
@@ -561,10 +524,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--amp", action="store_true")
     p.add_argument("--force-amp", action="store_true", help="Force AMP even if auto-disabled for stability")
     p.add_argument("--accum-steps", type=int, default=4)
-    
+
     p.add_argument("--teacher-setting", type=str, default="precise")
     p.add_argument("--teacher-compile", action="store_true")
-    
+
     # Loss weights
     p.add_argument("--alpha", type=float, default=0.2)
     p.add_argument("--beta-coarse", type=float, default=1.0)
@@ -575,32 +538,33 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-tv-coarse", type=float, default=0.01)
     p.add_argument("--lambda-tv-refine", type=float, default=0.05)
     p.add_argument("--conf-thresh-kl", type=float, default=0.1)
-    
+
     p.add_argument("--log-interval", type=int, default=100)
     p.add_argument("--val-interval", type=int, default=200)
-    
+
     p.add_argument("--ema-alpha", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
-    
+
     return p
+
 
 def get_phase_config(epoch):
     keyframes = {
-        1: {"phase": "DISTILL", "w": {"distill": 1.0, "fold": 0.0, "photo": 0.5, "cycle": 0.0, "geo": 0.1, "homo": 0.5},
+        1: {"phase": "DISTILL", "w": {"distill": 1.0, "fold": 0.0, "photo": 0.5, "cycle": 0.0, "geo": 0.1},
             "train_aggregator": False},
-        8: {"phase": "DISTILL", "w": {"distill": 1.0, "fold": 0.0, "photo": 0.5, "cycle": 0.0, "geo": 0.1, "homo": 0.5},
+        8: {"phase": "DISTILL", "w": {"distill": 1.0, "fold": 0.0, "photo": 0.5, "cycle": 0.0, "geo": 0.1},
             "train_aggregator": False},
         10: {"phase": "TPS_REFINE",
-             "w": {"distill": 0.5, "fold": 2.0, "photo": 1.0, "cycle": 0.0, "geo": 1.0, "homo": 0.2},
+             "w": {"distill": 0.5, "fold": 0.5, "photo": 1.0, "cycle": 0.0, "geo": 1.0},
              "train_aggregator": True},
         15: {"phase": "TPS_REFINE",
-             "w": {"distill": 0.5, "fold": 2.0, "photo": 1.0, "cycle": 0.0, "geo": 1.0, "homo": 0.2},
+             "w": {"distill": 0.5, "fold": 1.0, "photo": 1.0, "cycle": 0.0, "geo": 1.0},
              "train_aggregator": True},
         17: {"phase": "SELF_SUPERVISED",
-             "w": {"distill": 0.1, "fold": 5.0, "photo": 2.0, "cycle": 1.0, "geo": 3.0, "homo": 0.1},
+             "w": {"distill": 0.1, "fold": 3.0, "photo": 2.0, "cycle": 1.0, "geo": 3.0},
              "train_aggregator": True},
         100: {"phase": "SELF_SUPERVISED",
-              "w": {"distill": 0.1, "fold": 5.0, "photo": 2.0, "cycle": 1.0, "geo": 3.0, "homo": 0.1},
+              "w": {"distill": 0.1, "fold": 3.0, "photo": 2.0, "cycle": 1.0, "geo": 3.0},
               "train_aggregator": True},
     }
 
@@ -645,59 +609,95 @@ def get_phase_config(epoch):
         "train_matcher": True
     }
 
+
 # 主函数
 def main() -> None:
     args = build_argparser().parse_args()
     set_seed(args.seed)
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = args.amp
     if device.type == "cuda" and use_amp and not args.force_amp:
         major, minor = torch.cuda.get_device_capability()
         if major < 8:
-            print(f"[AMP] Auto-disabled AMP for stability on this GPU (capability={major}.{minor}). Use --force-amp to override.")
+            print(
+                f"[AMP] Auto-disabled AMP for stability on this GPU (capability={major}.{minor}). Use --force-amp to override.")
             use_amp = False
     writer = SummaryWriter(log_dir=str(args.log_dir))
-    
 
-    # 加载数据集
-    train_dataset = MultiScaleDataset(args.pairs_file, is_train=True, val_ratio=args.val_ratio, return_split='train')
-    val_dataset = MultiScaleDataset(args.pairs_file, is_train=False, val_ratio=args.val_ratio, return_split='val')
-    
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
-                              num_workers=args.num_workers, collate_fn=multi_scale_collate_fn, pin_memory=True, persistent_workers=True,prefetch_factor=2)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
-                            num_workers=args.num_workers, collate_fn=multi_scale_collate_fn)
+    use_cache = args.cache_dir is not None and args.cache_dir.exists()
 
-    # 初始化 Teacher (RoMaV2)
+    if use_cache:
+        print(f"[Dataset] 使用预计算缓存模式: {args.cache_dir}")
+        train_dataset = CachedTeacherDataset(
+            args.cache_dir, val_ratio=args.val_ratio, return_split='train'
+        )
+        val_dataset = CachedTeacherDataset(
+            args.cache_dir, val_ratio=args.val_ratio, return_split='val'
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, collate_fn=cached_collate_fn,
+            pin_memory=True, persistent_workers=True, prefetch_factor=2,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, collate_fn=cached_collate_fn,
+            persistent_workers=True,
+        )
+    else:
+        if args.pairs_file is None:
+            raise ValueError("必须提供 --pairs-file 或有效的 --cache-dir")
+        print(f"[Dataset] 使用原始图像对模式: {args.pairs_file}")
+        train_dataset = MultiScaleDataset(args.pairs_file, val_ratio=args.val_ratio, return_split='train')
+        val_dataset = MultiScaleDataset(args.pairs_file, val_ratio=args.val_ratio, return_split='val')
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, collate_fn=multi_scale_collate_fn,
+            pin_memory=True, persistent_workers=True, prefetch_factor=2,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, collate_fn=multi_scale_collate_fn,
+            persistent_workers=True,
+        )
+
+    # 缓存模式下 teacher 仅用于探测 feature dim，不参与训练循环推理
     teacher = RoMaV2(RoMaV2.Cfg(setting=args.teacher_setting)).to(device).eval()
-    
-    # 初始化 Student (AgriTPSStitcher)
-    with torch.no_grad():
+
+    with torch.inference_mode():
         dummy_img = torch.zeros(1, 3, 512, 512, device=device)
         img_a_lr, _, _, _ = make_teacher_inputs(dummy_img, dummy_img, teacher)
-        # 提取特征并检查 shape
         feat_a_flat, _ = extract_teacher_features_ds(teacher, img_a_lr, img_a_lr, args.teacher_grid_size)
         actual_teacher_dim = feat_a_flat.shape[-1]
         print(f"Detected Teacher Feature Dimension: {actual_teacher_dim}")
 
+    # 缓存模式下释放 teacher 显存（训练循环里不再需要它）
+    if use_cache:
+        teacher.cpu()
+        torch.cuda.empty_cache()
+        print("[Cache] Teacher moved to CPU to free GPU memory.")
+
     student = AgriTPSStitcher(
         matcher_config={
-            'd_model': args.d_model, 
+            'd_model': args.d_model,
             'teacher_dim': actual_teacher_dim,
             'grid_size': args.teacher_grid_size
-        }, 
+        },
         tps_config={
-            'grid_size': 10, 
+            'grid_size': 10,
             'feat_channels': args.d_model
         }
     ).to(device)
 
     # 优化器
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    
-    total_steps = len(train_loader) * args.epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
+
+    total_optimizer_steps = (len(train_loader) * args.epochs) // args.accum_steps
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_optimizer_steps, eta_min=1e-6
+    )
+
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     loss_tracker = EMALossTracker(alpha=args.ema_alpha)
 
@@ -731,49 +731,68 @@ def main() -> None:
         loss_tracker = EMALossTracker(alpha=args.ema_alpha)
         loss_tracker.ema_values['total'] = train_loss_ema
 
-        # scheduler 需要跳过已执行的 step
-        for _ in range(global_step):
-            scheduler.step()
-
         print(f"Resumed from epoch={start_epoch}, step={global_step}, "
               f"best_val={best_val_loss:.4f}")
+
+    prev_grad_states = {}
 
     for epoch in range(start_epoch, args.epochs + 1):
         cfg = get_phase_config(epoch)
         print(f"\n🚀 Entering Phase: {cfg['phase']} (Epoch {epoch})")
-        
+
+        reset_count = 0
         for name, param in student.named_parameters():
+            # 确定当前参数应该的状态
             if "backbone" in name:
-                param.requires_grad = False
+                target_req_grad = False
             elif "tps_estimator.aggregator" in name:
-                param.requires_grad = cfg['train_aggregator']
+                target_req_grad = cfg['train_aggregator']
             elif "matcher" in name:
-                param.requires_grad = cfg['train_matcher']
+                target_req_grad = cfg['train_matcher']
             else:
-                param.requires_grad = True
+                target_req_grad = True
+
+            # 状态翻转检测：如果由 False 变为 True
+            if prev_grad_states.get(name, target_req_grad) is False and target_req_grad is True:
+                # 彻底清空该参数的历史动量
+                if param in optimizer.state:
+                    optimizer.state[param] = {}
+                    reset_count += 1
+
+            param.requires_grad = target_req_grad
+            prev_grad_states[name] = target_req_grad
+
+        if reset_count > 0:
+            print(f"🧹 Optimizer states reset for {reset_count} unfrozen parameter tensors!")
 
         student.train()
         student.matcher.backbone.eval()
 
         for i, batch in enumerate(train_loader):
-            img_a_list = [x.to(device, non_blocking=True) for x in batch["img_a"]]
-            img_b_list = [x.to(device, non_blocking=True) for x in batch["img_b"]]
+            if use_cache:
+                # CachedTeacherDataset：collate 已经 stack 好，直接移到 GPU
+                img_a = batch['img_a'].to(device, non_blocking=True)
+                img_b = batch['img_b'].to(device, non_blocking=True)
+            else:
+                # MultiScaleDataset：列表形式，需要手动对齐尺寸后 stack
+                img_a_list = [x.to(device, non_blocking=True) for x in batch['img_a']]
+                img_b_list = [x.to(device, non_blocking=True) for x in batch['img_b']]
 
-            target_h, target_w = img_a_list[0].shape[-2:]
-            B = len(img_a_list)
+                target_h, target_w = img_a_list[0].shape[-2:]
+                B = len(img_a_list)
 
-            img_a = torch.empty((B, 3, target_h, target_w), device=device, dtype=img_a_list[0].dtype)
-            img_b = torch.empty((B, 3, target_h, target_w), device=device, dtype=img_b_list[0].dtype)
+                img_a = torch.empty((B, 3, target_h, target_w), device=device, dtype=img_a_list[0].dtype)
+                img_b = torch.empty((B, 3, target_h, target_w), device=device, dtype=img_b_list[0].dtype)
 
-            for b_idx, (a, b) in enumerate(zip(img_a_list, img_b_list)):
-                if a.shape[-2:] != (target_h, target_w):
-                    img_a[b_idx] = F.interpolate(a.unsqueeze(0), size=(target_h, target_w), mode='bilinear',
-                                                 align_corners=False).squeeze(0)
-                    img_b[b_idx] = F.interpolate(b.unsqueeze(0), size=(target_h, target_w), mode='bilinear',
-                                                 align_corners=False).squeeze(0)
-                else:
-                    img_a[b_idx] = a
-                    img_b[b_idx] = b
+                for b_idx, (a, b) in enumerate(zip(img_a_list, img_b_list)):
+                    if a.shape[-2:] != (target_h, target_w):
+                        img_a[b_idx] = F.interpolate(a.unsqueeze(0), size=(target_h, target_w),
+                                                     mode='bilinear', align_corners=False).squeeze(0)
+                        img_b[b_idx] = F.interpolate(b.unsqueeze(0), size=(target_h, target_w),
+                                                     mode='bilinear', align_corners=False).squeeze(0)
+                    else:
+                        img_a[b_idx] = a
+                        img_b[b_idx] = b
 
             # input sanity
             if not torch.isfinite(img_a).all().item():
@@ -783,20 +802,47 @@ def main() -> None:
                 print(f"[NaN/Inf] input/img_b: {_finite_stats(img_b)}")
                 continue
 
-            with torch.no_grad():
-                img_a_lr, img_b_lr, img_a_hr, img_b_hr = make_teacher_inputs(img_a, img_b, teacher)
-                t_out = teacher(img_a_lr, img_b_lr, img_a_hr, img_b_hr)
-                t_feat_a, t_feat_b = extract_teacher_features_ds(teacher, img_a_lr, img_b_lr, args.teacher_grid_size)
+            if use_cache:
+                # 直接从 batch 取，零推理开销
+                t_warp_AB = batch['t_warp_AB'].to(device, non_blocking=True)
+                t_conf_AB = batch['t_conf_AB'].to(device, non_blocking=True)
+                t_feat_a = batch['t_feat_a'].to(device, non_blocking=True)
+                t_feat_b = batch['t_feat_b'].to(device, non_blocking=True)
+                t_out = {'warp_AB': t_warp_AB, 'confidence_AB': t_conf_AB}
+            else:
+                with torch.inference_mode():
+                    img_a_lr, img_b_lr, img_a_hr, img_b_hr = make_teacher_inputs(img_a, img_b, teacher)
+                    t_out = teacher(img_a_lr, img_b_lr, img_a_hr, img_b_hr)
+                    t_feat_a, t_feat_b = extract_teacher_features_ds(
+                        teacher, img_a_lr, img_b_lr, args.teacher_grid_size
+                    )
 
             # loss 计算
             def _forward_losses(amp_enabled: bool):
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
-                    stu_out = student(img_a, img_b)  # 返回 dense_grid, delta_cp, matcher_out, tps_out
-                    stu_output=stu_out["matcher_out"]
-                    warp_refine, conf_refine = stu_output['warp_AB'], stu_output['confidence_AB']
-                    B, H, W, _ = warp_refine.shape
-                    grid = make_grid(B, H, W, warp_refine.device, warp_refine.dtype)
-                    current_flow = warp_refine - grid
+                    stu_out = student(img_a, img_b)
+                    stu_output = stu_out["matcher_out"]
+
+                    final_grid = stu_out["dense_grid"]  # [B, H_img, W_img, 2]
+                    conf_refine = stu_output['confidence_AB']
+
+                    B_img, H_img, W_img, _ = final_grid.shape
+                    grid_full = make_grid(B_img, H_img, W_img, final_grid.device, final_grid.dtype)
+                    current_flow_final = final_grid - grid_full
+
+                    # 将置信度上采样到全分辨率以对齐 geo_loss
+                    if conf_refine.shape[-2:] != (H_img, W_img):
+                        conf_for_geo = F.interpolate(
+                            conf_refine.unsqueeze(1),
+                            size=(H_img, W_img),
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze(1)
+                    else:
+                        conf_for_geo = conf_refine
+
+                    geo_loss = geo_loss_fn(current_flow_final, conf_for_geo)
+
                     d_loss = distill_loss_fn(
                         stu_output=stu_output,
                         teacher_warp=t_out["warp_AB"],
@@ -804,13 +850,13 @@ def main() -> None:
                         teacher_feat_A=t_feat_a,
                         teacher_feat_B=t_feat_b,
                     )
-                    geo_loss = geo_loss_fn(current_flow, conf_refine)
+
                     f_loss = stu_out["tps_out"].get("fold_loss", torch.tensor(0.0, device=device))
                     p_loss = compute_photometric_loss(
                         img_a, img_b, stu_out["dense_grid"], stu_out["matcher_out"]["confidence_AB"]
                     )
 
-                    if cfg["phase"] == "SELF_SUPERVISED":
+                    if "SELF_SUPERVISED" in cfg["phase"]:
                         # 不对称特征扰动，给逆向过程 (B->A) 的图像注入高斯噪声或微小亮度偏移。强迫网络依靠高维语义和几何结构去匹配，而不是死记硬背像素值。
                         noise_std = 0.02
                         noise_b = torch.randn_like(img_b) * noise_std
@@ -830,16 +876,16 @@ def main() -> None:
                     else:
                         c_loss = torch.tensor(0.0, device=device)
 
-                    h_loss = torch.norm(stu_out.get('H_mat', torch.eye(3).to(device)) - torch.eye(3).to(device))
+                    # h_loss = torch.norm(stu_out.get('H_mat', torch.eye(3).to(device)) - torch.eye(3).to(device))
 
                     w = cfg["weights"]
                     total_loss = (
-                        w["distill"] * d_loss["total"]
-                        + w["fold"] * f_loss
-                        + w["photo"] * p_loss
-                        + w["cycle"] * c_loss
-                        + w["geo"] * geo_loss
-                        + w.get("homo", 0.1) * h_loss
+                            w["distill"] * d_loss["total"]
+                            + w["fold"] * f_loss
+                            + w["photo"] * p_loss
+                            + w["cycle"] * c_loss
+                            + w["geo"] * geo_loss
+                        # + w.get("homo", 0.1) * h_loss
                     )
                 return stu_out, d_loss, f_loss, p_loss, c_loss, geo_loss, total_loss
 
@@ -858,7 +904,8 @@ def main() -> None:
             ok &= _check_finite("loss/distill_total", d_loss["total"])
             ok &= _check_finite("loss/fold", f_loss if torch.is_tensor(f_loss) else torch.tensor(f_loss, device=device))
             ok &= _check_finite("loss/photo", p_loss)
-            ok &= _check_finite("loss/cycle", c_loss if torch.is_tensor(c_loss) else torch.tensor(c_loss, device=device))
+            ok &= _check_finite("loss/cycle",
+                                c_loss if torch.is_tensor(c_loss) else torch.tensor(c_loss, device=device))
             ok &= _check_finite("loss/total", total_loss)
             if isinstance(stu_out, dict):
                 if "dense_grid" in stu_out and torch.is_tensor(stu_out["dense_grid"]):
@@ -871,32 +918,24 @@ def main() -> None:
                     ok &= _check_finite("stu/delta_cp", to["delta_cp"])
 
             if not ok:
-                # AMP fallback: rerun this batch in fp32 once; if it becomes finite, disable AMP for stability.
                 if use_amp:
-                    print("[NaN/Inf] Detected under AMP. Retrying this batch with AMP disabled...")
-                    stu_out, d_loss, f_loss, p_loss, c_loss, geo_loss, total_loss = _forward_losses(False)
-                    ok2 = True
-                    ok2 &= _check_finite("fp32/loss/total", total_loss)
+                    print("[NaN/Inf] Detected under AMP. Retrying in fp32...")
+                    stu_out, d_loss, f_loss, p_loss, c_loss, geo_loss, total_loss = \
+                        _forward_losses(False)
+                    ok2 = _check_finite("fp32/loss/total", total_loss)
                     if ok2:
-                        print("[AMP] Disabling AMP due to instability (continuing in fp32).")
+                        print("[AMP] Disabling AMP, continuing in fp32.")
                         use_amp = False
                         scaler = torch.amp.GradScaler("cuda", enabled=False)
-                        # continue to backward in fp32 below
+                        loss_for_backward = total_loss / args.accum_steps  # <-- 关键：重新赋值
                     else:
                         optimizer.zero_grad(set_to_none=True)
-                        if device.type == "cuda":
-                            torch.cuda.empty_cache()
+                        if device.type == "cuda": torch.cuda.empty_cache()
                         continue
                 else:
                     optimizer.zero_grad(set_to_none=True)
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
+                    if device.type == "cuda": torch.cuda.empty_cache()
                     continue
-
-                optimizer.zero_grad(set_to_none=True)
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-                continue
 
             scaler.scale(loss_for_backward).backward()
 
@@ -920,13 +959,14 @@ def main() -> None:
                         'geo': geo_loss.item()
                     }
                     smoothed = loss_tracker.update(loss_metrics)
-                    print(f"""Epoch {epoch} | Step {global_step} | Loss: {smoothed['total_ema']:.4f} | Photo: {smoothed['photo_ema']:.4f} | Fold: {smoothed['fold_ema']:.4f} | Geo: {smoothed['geo_ema']}""")
+                    print(
+                        f"""Epoch {epoch} | Step {global_step} | Loss: {smoothed['total_ema']:.4f} | Photo: {smoothed['photo_ema']:.4f} | Fold: {smoothed['fold_ema']:.4f} | Geo: {smoothed['geo_ema']}""")
                     for k, v in smoothed.items():
                         writer.add_scalar(f"Train/{k}", v, global_step)
-                    
+
                     with torch.no_grad():
                         visualize_results(img_a, img_b, stu_out, global_step, writer)
-                
+
                 # Validate
                 if global_step % args.val_interval == 0:
                     val_losses = validate(
@@ -938,14 +978,14 @@ def main() -> None:
                         teacher_grid_size=args.teacher_grid_size,
                     )
                     val_total = val_losses['total']
-                    
+
                     print(f"📊 [val] step={global_step} | total={val_total:.4f}")
                     writer.add_scalar("Val/Total", val_total, global_step)
-                    
+
                     is_best = val_total < best_val_loss
                     if is_best:
                         best_val_loss = val_total
-                    
+
                     save_checkpoint(
                         args.save_dir, epoch, global_step,
                         student, optimizer, scheduler,
@@ -955,7 +995,7 @@ def main() -> None:
                         best_val_loss=best_val_loss,
                         is_best=is_best,
                     )
-        
+
         print(f"[epoch {epoch}] Done. EMA={loss_tracker.get_ema('total'):.4f}")
 
     writer.close()

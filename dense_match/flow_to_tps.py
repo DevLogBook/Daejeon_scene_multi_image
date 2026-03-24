@@ -60,12 +60,12 @@ class ConfidenceWeightedVotingDynamic(nn.Module):
         self.min_weight_sum = min_weight_sum
         self.max_cached_resolutions = max_cached_resolutions
 
-        self.cp_spacing = 2.0 / max(grid_size - 1, 1)
+        self.cp_spacing = 2.0 / grid_size
         self.sigma = sigma_scale * self.cp_spacing
 
-        # 预计算控制点坐标（固定，注册为buffer随模型保存）
-        y_cp = torch.linspace(-1.0, 1.0, grid_size)
-        x_cp = torch.linspace(-1.0, 1.0, grid_size)
+        y_cp = torch.linspace(-1.0 + 1.0 / grid_size, 1.0 - 1.0 / grid_size, grid_size)
+        x_cp = torch.linspace(-1.0 + 1.0 / grid_size, 1.0 - 1.0 / grid_size, grid_size)
+
         gy, gx = torch.meshgrid(y_cp, x_cp, indexing="ij")
         cp_coords = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=1)  # (N_cp, 2)
         self.register_buffer("cp_coords", cp_coords)
@@ -246,7 +246,7 @@ class FlowAggregator(nn.Module):
         super().__init__()
         self.grid_size  = grid_size
         self.hidden_ch  = hidden_ch
-        cp_spacing      = 2.0 / max(grid_size - 1, 1)
+        cp_spacing = 2.0 / grid_size
         self.max_delta  = delta_scale * cp_spacing
 
         # 特征一致性头：(feat_A, feat_B) → 1通道一致性图
@@ -332,8 +332,8 @@ class _FoldingPenaltyCP(nn.Module):
     def forward(self, delta_cp: torch.Tensor) -> torch.Tensor:
         """delta_cp: (B, 2, gs, gs) → fold_loss: scalar"""
         gs = self.grid_size
-        y_cp = torch.linspace(-1., 1., gs, device=delta_cp.device, dtype=delta_cp.dtype)
-        x_cp = torch.linspace(-1., 1., gs, device=delta_cp.device, dtype=delta_cp.dtype)
+        y_cp = torch.linspace(-1.0 + 1.0 / gs, 1.0 - 1.0 / gs, gs, device=delta_cp.device, dtype=delta_cp.dtype)
+        x_cp = torch.linspace(-1.0 + 1.0 / gs, 1.0 - 1.0 / gs, gs, device=delta_cp.device, dtype=delta_cp.dtype)
         gy, gx = torch.meshgrid(y_cp, x_cp, indexing="ij")
         src = torch.stack([gx, gy], dim=0).unsqueeze(0)  # (1,2,gs,gs)
 
@@ -498,13 +498,13 @@ class BypassTPSEstimator(nn.Module):
         extra_ch = int(use_entropy) + int(use_cf_consistency)
         total_in_ch = base_ch + extra_ch   # 5, 6, 或 7（固定，不受运行时条件影响）
 
-        # ── 物理投票（无参数）──
+        # 物理投票（无参数
         self.voter = ConfidenceWeightedVotingDynamic(
             grid_size=grid_size,
             sigma_scale=sigma_scale,
         )
 
-        # ── FlowAggregator（唯一实例，GATED模式）──
+        # FlowAggregator
         self.aggregator = FlowAggregator(
             grid_size=grid_size,
             feat_channels=feat_channels,
@@ -577,7 +577,7 @@ class BypassTPSEstimator(nn.Module):
                 ent_map = self.entropy_extractor(sim_matrix, gs, gs)
             
             # 统一缩放到当前 Fine 分辨率 (H, W)
-            anti_entropy_map = F.interpolate(1.0 - ent_map, size=(H, W), mode="bilinear")
+            anti_entropy_map = F.interpolate(1.0 - ent_map, size=(H, W), mode="bilinear", align_corners=False)
             channels.append(anti_entropy_map)
 
         if self.use_cf_consistency:
@@ -597,15 +597,15 @@ class BypassTPSEstimator(nn.Module):
         # FlowAggregator
         delta_cp, gate = self.aggregator(feat_in, delta_cp_init, feat_A, feat_B)
 
-        if self.training:
+        if self.training and dense_field is not None:
             fold_out = self.folding(delta_cp, dense_field)
         else:
             fold_out = {
-                "fold_loss":  torch.zeros(1, device=device, dtype=dtype).squeeze(),
-                "loss_cp":    0.0,
+                "fold_loss": torch.zeros(1, device=device, dtype=dtype).squeeze(),
+                "loss_cp": 0.0,
                 "loss_dense": 0.0,
                 "fold_ratio": 0.0,
-                "fold_mask":  None,
+                "fold_mask": None,
             }
 
         return {
@@ -629,15 +629,13 @@ class TPSGridGenerator(nn.Module):
         super().__init__()
         self.gs = grid_size
 
-        # 1. 控制点 (Control Points) 属于纯几何锚点
-        # 必须锚定在绝对边缘 [-1, 1]，以确保 TPS 能包裹整个图像域。
-        # 这里保留 linspace(-1, 1, grid_size) 是严谨且正确的。
-        y, x = torch.meshgrid(torch.linspace(-1, 1, grid_size),
-                              torch.linspace(-1, 1, grid_size), indexing='ij')
+        y_cp = torch.linspace(-1.0 + 1.0 / grid_size, 1.0 - 1.0 / grid_size, grid_size)
+        x_cp = torch.linspace(-1.0 + 1.0 / grid_size, 1.0 - 1.0 / grid_size, grid_size)
+        y, x = torch.meshgrid(y_cp, x_cp, indexing='ij')
         p_src = torch.stack([x.reshape(-1), y.reshape(-1)], dim=1)  # (N_cp, 2)
         self.register_buffer("p_src", p_src)
 
-        # 2. 预计算 L 逆矩阵 (Static)
+        # 预计算 L 逆矩阵 (Static)
         dist_cp = torch.cdist(p_src, p_src)
         K = self._tps_kernel(dist_cp)
         P = torch.cat([torch.ones(grid_size ** 2, 1), p_src], dim=1)
@@ -648,8 +646,13 @@ class TPSGridGenerator(nn.Module):
         # 增加微小偏置确保矩阵可逆
         self.register_buffer("L_inv", torch.inverse(L + torch.eye(L.shape[0]) * 1e-6))
 
-        # 3. 初始化缓存字典 (针对不同分辨率 H, W)
+        # 初始化缓存字典 (针对不同分辨率 H, W)
         self._cache = {}
+
+    def _apply(self, fn):
+        """模型迁移设备或 dtype 时自动清空几何缓存，防止 stale 张量。"""
+        self._cache.clear()
+        return super()._apply(fn)
 
     def _tps_kernel(self, r):
         r_sq = r ** 2
@@ -663,10 +666,6 @@ class TPSGridGenerator(nn.Module):
         # 缓存静态几何矩阵 (K_pix, P_pix)
         key = (H, W, str(device), str(dtype))
         if key not in self._cache:
-            # ==========================================================
-            # 核心修复区：像素中心对齐 (align_corners=False 规范)
-            # 彻底消除与 F.grid_sample 之间的半像素物理错位！
-            # ==========================================================
             ys = (torch.arange(H, device=device, dtype=dtype) + 0.5) * (2.0 / H) - 1.0
             xs = (torch.arange(W, device=device, dtype=dtype) + 0.5) * (2.0 / W) - 1.0
             yy, xx = torch.meshgrid(ys, xs, indexing='ij')

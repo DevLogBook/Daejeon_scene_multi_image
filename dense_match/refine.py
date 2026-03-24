@@ -107,42 +107,47 @@ def _gn_groups(ch: int, max_groups: int = 8) -> int:
             return g
     return 1
 
-def compute_local_correlation(feat_A, sampled_B, radius=2):
-    """
-    计算 feat_A 与 sampled_B 局部邻域的相关性
-    feat_A: (B, C, H, W)
-    sampled_B: (B, C, H, W) - 已经是根据 prev_warp 采样后的特征
-    radius: 2 表示 5x5 窗口
-    返回: (B, (2*radius+1)^2, H, W)
-    """
+
+def compute_local_correlation(
+        feat_A: torch.Tensor,  # (B, C, H, W)
+        sampled_B: torch.Tensor,  # (B, C, H, W)
+        radius: int = 2,
+    ) -> torch.Tensor:  # (B, (2*radius+1)^2, H, W)
     B, C, H, W = feat_A.shape
-    window_size = 2 * radius + 1
-    
-    # 对 sampled_B 进行 padding，以便处理边缘
-    padded_B = F.pad(sampled_B, (radius, radius, radius, radius), mode='replicate')
-    
-    # 使用 unfold 提取所有 5x5 的 patch
-    # output shape: (B, C * window_size^2, H * W)
-    patches_B = F.unfold(padded_B, kernel_size=window_size)
-    
-    # 重塑为 (B, C, window_size^2, H, W)
-    patches_B = patches_B.view(B, C, window_size**2, H, W)
-    
-    # 计算 feat_A 与每个 patch 位置的点积 (Correlation)
-    # feat_A: (B, C, 1, H, W) * patches_B: (B, C, window_size^2, H, W)
-    # 在 C 维度求和 -> (B, window_size^2, H, W)
-    corr = (feat_A.unsqueeze(2) * patches_B).sum(dim=1)
-    corr = corr / (torch.norm(feat_A, dim=1, keepdim=True) * torch.norm(patches_B, dim=1) + 1e-8)
-    
-    return corr
+    ws = 2 * radius + 1
+
+    # 对 sampled_B 做 replicate padding
+    padded_B = F.pad(sampled_B, [radius] * 4, mode='replicate')  # (B,C,H+2r,W+2r)
+
+    # F.unfold 一次性提取所有 ws×ws 邻域 patch
+    # 输出形状: (B, C*ws^2, H*W)
+    unfolded = F.unfold(padded_B, kernel_size=ws)
+
+    # 整理为 (B, C, ws^2, H*W) 方便与 feat_A 做点积
+    unfolded = unfolded.view(B, C, ws * ws, H * W)
+
+    # feat_A 展平并增加 ws^2 维度以便广播
+    feat_A_flat = feat_A.view(B, C, 1, H * W)  # (B, C, 1, H*W)
+
+    # 沿通道维度求点积
+    dot = (feat_A_flat * unfolded).sum(dim=1)  # (B, ws^2, H*W)
+
+    # L2 归一化
+    norm_A = feat_A_flat.norm(dim=1)  # (B, 1,    H*W)
+    norm_B = unfolded.norm(dim=1)  # (B, ws^2, H*W)
+
+    # 余弦相似度
+    corr = dot / (norm_A * norm_B + 1e-8)  # (B, ws^2, H*W)
+    return corr.view(B, ws * ws, H, W)
 
 
 class ConvGNAct(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: Optional[int] = None):
+    def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: Optional[int] = None, dilation: int = 1):
         super().__init__()
         if p is None:
-            p = k // 2
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False)
+            p = (k // 2) * dilation
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s,
+                              padding=p, dilation=dilation, bias=False)
         self.gn = nn.GroupNorm(_gn_groups(out_ch), out_ch)
         self.act = nn.GELU()
 
@@ -168,8 +173,8 @@ class DWConvGNAct(nn.Module):
         r = x
         x = self.pw1(x)
         x = self.act(self.gn(self.dw(x)))
-        x = self.gn2(self.pw2(x))
-        return self.act(x + r)
+        x = self.act(self.gn2(self.pw2(x)))
+        return x + r
 
 
 # WarpRefiner
@@ -208,10 +213,10 @@ class WarpRefiner(nn.Module):
         self.stem = ConvGNAct(in_ch, hidden, k=1, s=1, p=0)
         # self.blocks = nn.Sequential(*[DWConvGNAct(hidden, expansion=2) for _ in range(num_blocks)])
         self.blocks = nn.Sequential(
-                    DWConvGNAct(hidden, expansion=2),
-                    ConvGNAct(hidden, hidden, k=3, p=2), # Dilated Conv
-                    DWConvGNAct(hidden, expansion=2)
-                )
+            DWConvGNAct(hidden, expansion=2),
+            ConvGNAct(hidden, hidden, k=3, dilation=2),
+            DWConvGNAct(hidden, expansion=2)
+        )
         self.delta_head = nn.Conv2d(hidden, 2, kernel_size=3, stride=1, padding=1)
         self.ov_head = nn.Conv2d(hidden, 1, kernel_size=3, stride=1, padding=1)
 
@@ -303,7 +308,7 @@ def ssim_map(img1, img2, mask, window_size=11, sigma=1.5):
     _, C, H, W = img1.shape
     device = img1.device
 
-    # 1. 准备高斯窗口
+    # 准备高斯窗口
     def gaussian(window_size, sigma):
         gauss = torch.exp(-(torch.arange(window_size).float() - window_size // 2) ** 2 / (2 * sigma ** 2))
         return gauss / gauss.sum()
@@ -365,31 +370,38 @@ def compute_photometric_loss(img_a, img_b, dense_grid, confidence, alpha=0.85):
     B, C, H, W = img_a.shape
     device = img_a.device
 
-    # 1. 采样 warped 图 (跟随 dense_grid 的尺寸)
-    warped_b = F.grid_sample(img_b, dense_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    img_a_raw = (img_a * std + mean).clamp(0, 1)
+    img_b_raw = (img_b * std + mean).clamp(0, 1)
+
+    # 采样 warped 图 (使用反归一化后的图像)
+    warped_b = F.grid_sample(img_b_raw, dense_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
 
     target_hw = warped_b.shape[-2:]
     if img_a.shape[-2:] != target_hw:
-        img_curr = F.interpolate(img_a, size=target_hw, mode='bilinear', align_corners=False)
+        img_curr = F.interpolate(img_a_raw, size=target_hw, mode='bilinear', align_corners=False)
     else:
-        img_curr = img_a
+        img_curr = img_a_raw
 
-    # 生成有效重叠掩码 (Overlap Mask)
+    # 生成有效重叠掩码
     ones = torch.ones((B, 1, *target_hw), device=device, dtype=img_a.dtype)
     mask = F.grid_sample(ones, dense_grid, mode='nearest', padding_mode='zeros', align_corners=False)
     mask = (mask > 0.9).float()
 
     l1_map = torch.abs(img_curr - warped_b).mean(dim=1, keepdim=True)
-    # 调用上个回合定义的 ssim_map_v2 (带 mask)
     s_map = ssim_map(img_curr, warped_b, mask)
     ssim_loss_map = 1 - s_map.mean(dim=1, keepdim=True)
 
     photo_loss_map = alpha * ssim_loss_map + (1 - alpha) * l1_map
 
-    # 5. 置信度对齐
+    # 置信度对齐
     if confidence.ndim == 3: confidence = confidence.unsqueeze(1)
-    conf = F.interpolate(confidence, size=target_hw, mode="bilinear") if confidence.shape[
-                                                                             -2:] != target_hw else confidence
+    if confidence.shape[-2:] != target_hw:
+        conf = F.interpolate(confidence, size=target_hw, mode="bilinear", align_corners=False)
+    else:
+        conf = confidence
 
     total_weight = conf * mask
     return (photo_loss_map * total_weight).sum() / (total_weight.sum() + 1e-6)

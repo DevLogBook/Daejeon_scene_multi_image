@@ -8,12 +8,7 @@ import torch.nn.functional as F
 from dense_match.backbone import MobileViTBackbone, generate_2d_sincos_pos_emb
 from dense_match.refine import (WarpRefiner,
                                 upsample_warp_and_overlap,
-                                compute_cycle_consistency_loss,
-                                compute_photometric_loss,
-                                safe_grid_sample,
-                                make_grid,
-                                ssim_map,
-                                ssim_map)
+                                make_grid)
 from dense_match.flow_to_tps import BypassTPSEstimator, TPSGridGenerator
 
 
@@ -69,28 +64,34 @@ class MatchWindowAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.window_size = window_size
-        self.mha = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model)
+        self.mha_A = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.mha_B = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.norm_A = nn.LayerNorm(d_model)
+        self.norm_B = nn.LayerNorm(d_model)
+        self.ffn_norm_A = nn.LayerNorm(d_model)
+        self.ffn_norm_B = nn.LayerNorm(d_model)
+        self.ffn_A = nn.Sequential(
+            nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, d_model)
+        )
+        self.ffn_B = nn.Sequential(
+            nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, d_model)
         )
 
+
     def window_partition(self, x, H, W):
-        """将特征图划分为窗口"""
-        B, N, C = x.shape
-        x = x.view(B, H, W, C)
-        # 填充以确保能被 window_size 整除
-        pad_h = (self.window_size - H % self.window_size) % self.window_size
-        pad_w = (self.window_size - W % self.window_size) % self.window_size
-        if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
-        
-        Hp, Wp = H + pad_h, W + pad_w
-        x = x.view(B, Hp // self.window_size, self.window_size, Wp // self.window_size, self.window_size, C)
-        windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, self.window_size * self.window_size, C)
-        return windows, (Hp, Wp)
+            """将特征图划分为窗口"""
+            B, N, C = x.shape
+            x = x.view(B, H, W, C)
+            # 填充以确保能被 window_size 整除
+            pad_h = (self.window_size - H % self.window_size) % self.window_size
+            pad_w = (self.window_size - W % self.window_size) % self.window_size
+            if pad_h > 0 or pad_w > 0:
+                x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+
+            Hp, Wp = H + pad_h, W + pad_w
+            x = x.view(B, Hp // self.window_size, self.window_size, Wp // self.window_size, self.window_size, C)
+            windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, self.window_size * self.window_size, C)
+            return windows, (Hp, Wp)
 
     def window_reverse(self, windows, H, W, Hp, Wp):
         """将窗口还原回特征图"""
@@ -108,28 +109,28 @@ class MatchWindowAttention(nn.Module):
 
         # Local Cross Attention (A attends to B within the same window)
         # 这里的逻辑是：只在对应的空间窗口内寻找匹配，适合位移不大的精细化匹配
-        attn_A, _ = self.mha(win_A, win_B, win_B)
-        attn_B, _ = self.mha(win_B, win_A, win_A)
+        attn_A, _ = self.mha_A(win_A, win_B, win_B)
+        attn_B, _ = self.mha_B(win_B, win_A, win_A)
 
-        # Window Reverse
         feat_A = self.window_reverse(attn_A, H, W, Hp, Wp)
         feat_B = self.window_reverse(attn_B, H, W, Hp, Wp)
 
-        # Residual & FFN
-        feat_A = self.norm(feat_A + short_cut_A)
-        feat_A = self.norm(feat_A + self.ffn(feat_A))
-        feat_B = self.norm(feat_B + short_cut_B)
-        feat_B = self.norm(feat_B + self.ffn(feat_B))
+        feat_A = self.norm_A(feat_A + short_cut_A)
+        feat_A = self.ffn_norm_A(feat_A + self.ffn_A(feat_A))
+        feat_B = self.norm_B(feat_B + short_cut_B)
+        feat_B = self.ffn_norm_B(feat_B + self.ffn_B(feat_B))
 
         return feat_A, feat_B
 
 
 class LocalGeometricValidator(nn.Module):
     """验证候选匹配的局部几何一致性 """
+
     def __init__(self, neighbor_radius=3):
         super().__init__()
         self.radius = neighbor_radius
-    
+        self.kernel_size = 2 * neighbor_radius + 1
+
     def forward(self, src_pos, candidate_positions, H, W):
         """
         src_pos: [B, N, 2]
@@ -137,125 +138,111 @@ class LocalGeometricValidator(nn.Module):
         H, W: 当前特征图的实际宽高
         """
         B, N, K, _ = candidate_positions.shape
-        
         geometric_scores = []
-        # 对 K 个候选峰值逐一评估
+
+        # 预先 reshape 源坐标，避免在循环中重复操作
+        src_2d = src_pos.reshape(B, H, W, 2).permute(0, 3, 1, 2)  # [B, 2, H, W]
+
         for k in range(K):
-            cand_pos = candidate_positions[:, :, k, :] # [B, N, 2]
-            
-            # 计算位移场 (Flow)
-            displacement = cand_pos - src_pos # [B, N, 2]
-            disp_2d = displacement.reshape(B, H, W, 2).permute(0, 3, 1, 2) # [B, 2, H, W]
-            
-            # 提取邻域位移
-            disp_unfold = F.unfold(
-                disp_2d,
-                kernel_size=2*self.radius+1,
-                padding=self.radius
-            ) # [B, 2*(2r+1)^2, N]
-            
-            # 计算邻域位移的一致性：方差越小，局部越像仿射变换
-            # 我们惩罚位移突变
-            disp_var = disp_unfold.var(dim=1) # [B, N]
-            
-            # 转换为一致性得分，1e-4 防止除零
-            score = 1.0 / (1.0 + disp_var * 100.0) 
+            cand_2d = candidate_positions[:, :, k, :].reshape(B, H, W, 2).permute(0, 3, 1, 2)
+            disp_2d = cand_2d - src_2d  # [B, 2, H, W]
+
+            # 使用 avg_pool2d 计算局部期望 E[X] 和 E[X^2]
+            mean_disp = F.avg_pool2d(disp_2d, self.kernel_size, stride=1, padding=self.radius)
+            mean_sq_disp = F.avg_pool2d(disp_2d ** 2, self.kernel_size, stride=1, padding=self.radius)
+
+            # 局部方差 Var(X) = E[X^2] - (E[X])^2
+            # clamp(min=0) 防止浮点误差导致负数
+            var_disp = (mean_sq_disp - mean_disp ** 2).clamp(min=0.0)  # [B, 2, H, W]
+
+            # 分别对 X 轴和 Y 轴的方差求和，这才是真正的空间平滑度度量
+            total_var = var_disp.sum(dim=1).reshape(B, N)  # [B, N]
+
+            # 转换为一致性得分，方差越小越接近仿射平移，得分越高
+            score = 1.0 / (1.0 + total_var * 100.0)
             geometric_scores.append(score)
-            
-        return torch.stack(geometric_scores, dim=-1) # [B, N, K]
+
+        return torch.stack(geometric_scores, dim=-1)  # [B, N, K]
 
 
 class MultiPeakAwareAttention(nn.Module):
-    def __init__(self, d_model=128, top_k=8, temperature=0.05, sinkhorn_iters=5):
+    def __init__(self, d_model=128, top_k=8, sinkhorn_iters=5):
         super().__init__()
         self.top_k = top_k
-        self.temp = temperature
         self.sinkhorn_iters = sinkhorn_iters
         self.geometric_validator = LocalGeometricValidator(neighbor_radius=3)
+        self.dustbin_score = nn.Parameter(torch.tensor(-1.0))
 
     def optimal_transport(self, scores):
-        """
-        对数域 Sinkhorn-Knopp 算法 (防 NaN、防溢出)
-        包含 Dustbin(垃圾桶) 机制，优雅处理遮挡和视野外(Out-of-FOV)像素。
-        """
-        B, M, N = scores.shape
-        device, dtype = scores.device, scores.dtype
+        # 强制转为 FP32，免疫 AMP 导致的 logsumexp 溢出 NaN
+        scores_f32 = scores.float()
+        B, M, N = scores_f32.shape
+        device = scores_f32.device
 
-        # 1. 扩充 Dustbin (垃圾桶) 行与列
-        # 我们的 scores 是 Cosine Similarity / temp。
-        # Cosine 相似度为 0 代表正交/完全不相关，所以 0.0 是一个极佳的天然垃圾桶阈值。
-        Z = torch.empty(B, M + 1, N + 1, device=device, dtype=dtype)
-        Z[:, :M, :N] = scores
-        Z[:, :M, N] = 0.0  # A 中没有匹配的点流向此处
-        Z[:, M, :N] = 0.0  # B 中没有匹配的点流向此处
-        Z[:, M, N] = 0.0  # 垃圾桶与垃圾桶的匹配
+        ds = self.dustbin_score.float()
+        row_dust = ds.view(1, 1, 1).expand(B, M, 1)  # [B, M, 1]
+        col_dust = ds.view(1, 1, 1).expand(B, 1, N)  # [B, 1, N]
+        corner = torch.zeros(B, 1, 1, device=device)  # [B, 1, 1]
+        top = torch.cat([scores_f32, row_dust], dim=2)  # [B, M, N+1]
+        bot = torch.cat([col_dust, corner], dim=2)  # [B, 1, N+1]
+        Z = torch.cat([top, bot], dim=1)
 
-        # 2. 设置边缘分布 (Marginal distributions)
-        # 常规点容量为 1，垃圾桶容量为 M 或 N。使用对数域避免浮点数下溢。
         norm = -math.log(M + N)
-        log_mu = torch.empty(B, M + 1, device=device, dtype=dtype).fill_(norm)
+        log_mu = torch.empty(B, M + 1, device=device, dtype=torch.float32).fill_(norm)
         log_mu[:, M] = math.log(N) + norm
 
-        log_nu = torch.empty(B, N + 1, device=device, dtype=dtype).fill_(norm)
+        log_nu = torch.empty(B, N + 1, device=device, dtype=torch.float32).fill_(norm)
         log_nu[:, N] = math.log(M) + norm
 
-        # 3. Sinkhorn 迭代 (Log-space 保证混合精度下的数值绝对稳定)
         u, v = torch.zeros_like(log_mu), torch.zeros_like(log_nu)
         for _ in range(self.sinkhorn_iters):
             u = log_mu - torch.logsumexp(Z + v.unsqueeze(1), dim=2)
             v = log_nu - torch.logsumexp(Z + u.unsqueeze(2), dim=1)
 
-        # 4. 计算最终的最优传输分配矩阵
         log_assign = Z + u.unsqueeze(2) + v.unsqueeze(1)
+        # 转回原始的 dtype (FP16 或 FP32) 以保持外层计算图兼容
+        return log_assign[:, :M, :N].to(scores.dtype)
 
-        # 剥离垃圾桶，只返回 N x N 的实际物理点匹配对数概率
-        return log_assign[:, :M, :N]
-
-    def forward(self, feat_A, feat_B, pos_A, pos_B, H, W):
+    def forward(self, feat_A, feat_B, pos_A, pos_B, H, W, current_temp, pos_B_for_geo=None):
         B, N, C = feat_A.shape
 
-        # 计算原始特征相似度
+        if pos_B_for_geo is None:
+            pos_B_for_geo = pos_B
+
         norm_A = F.normalize(feat_A, p=2, dim=-1)
         norm_B = F.normalize(feat_B, p=2, dim=-1)
         raw_sim_matrix = torch.bmm(norm_A, norm_B.transpose(1, 2))
 
-        # 放大分布差异后进入 Sinkhorn 进行全局软分配
-        scores = raw_sim_matrix / self.temp
+        scores = raw_sim_matrix / current_temp
         log_assign = self.optimal_transport(scores)
 
-        # 转回 [0, 1] 区间的概率分配矩阵
         ot_prob_matrix = torch.exp(log_assign)
-
-        # 提取候选峰值 (此时基于全局最优传输概率，而非单纯的局部盲目相似度)
-        # 彻底消灭了多对一的黑洞效应
         topk_values, topk_indices = ot_prob_matrix.topk(self.top_k, dim=-1)
 
-        # 获取候选点的物理坐标 [-1, 1]
+        # 用于最终 warp 输出的 B 图绝对物理坐标
         topk_positions = torch.gather(
             pos_B.unsqueeze(1).expand(-1, N, -1, -1),
             dim=2,
             index=topk_indices.unsqueeze(-1).expand(-1, -1, -1, 2)
         )
 
-        # 局部几何一致性校验
-        geo_scores = self.geometric_validator(pos_A, topk_positions, H, W)
+        # 消除旋转/透视引起的大方差，只检测纯粹的非刚性错位
+        topk_positions_for_geo = torch.gather(
+            pos_B_for_geo.unsqueeze(1).expand(-1, N, -1, -1),
+            dim=2,
+            index=topk_indices.unsqueeze(-1).expand(-1, -1, -1, 2)
+        )
 
-        # 可微消歧与坐标精修
-        # 此时 topk_values 处于 [0, 1] 区间，与 geo_scores 量级完美对齐
+        geo_scores = self.geometric_validator(pos_A, topk_positions_for_geo, H, W)
         combined_scores = topk_values + 1.5 * geo_scores
 
-        # 依然除以 temp 保持分布尖锐度，迫使网络做出明确选择
-        soft_weights = F.softmax(combined_scores / self.temp, dim=-1)
+        soft_weights = F.softmax(combined_scores / current_temp, dim=-1)
         refined_warp = (topk_positions * soft_weights.unsqueeze(-1)).sum(dim=2)
 
-        # 计算匹配熵 (Entropy)
-        # 原版基于 raw_sim_matrix 计算，这里直接用 OT 后的概率分布计算。 它不仅反映局部模糊度，还反映全局竞争后的置信度，这让后面的 Confidence 预测极度精准。
         prob_dist = ot_prob_matrix / (ot_prob_matrix.sum(dim=-1, keepdim=True) + 1e-8)
         entropy = -(prob_dist * (prob_dist + 1e-8).log()).sum(dim=-1)
 
-        # 返回 raw_sim_matrix 以保证完全不破坏 AgriMatcher 外层结构与 DistillationLoss 的计算
         return refined_warp, entropy, raw_sim_matrix
-
 
 def solve_weighted_dlt(src_pts, dst_pts, weights, eps=1e-6):
     """
@@ -413,7 +400,7 @@ class AgriMatcher(nn.Module):
             residual_overlap=True,
         )
 
-    def forward(self, img_A, img_B):
+    def forward(self, img_A, img_B, H_prior=None):
         B = img_A.shape[0]
 
         device = img_A.device
@@ -444,37 +431,59 @@ class AgriMatcher(nn.Module):
             else:
                 feat_A, feat_B = layer(feat_A, feat_B)
 
-        pos_A = self._get_token_coords(B, Hc, Wc, device, dtype) # [B, N, 2]
+        pos_A = self._get_token_coords(B, Hc, Wc, device, dtype)  # [B, N, 2]
         pos_B = pos_A
 
         # 特征蒸馏
         distill_feat_A = self.feature_projector(feat_A)
         distill_feat_B = self.feature_projector(feat_B)
-        
-        # Similarity Matrix（关键数值路径强制 fp32，避免 AMP 下 NaN）
-        temp = self.temperature.clamp(min=0.01).float()
+
+        temp = self.temperature.clamp(min=0.07, max=1.0).float()
         norm_A = F.normalize(feat_A.float(), p=2, dim=-1)
         norm_B = F.normalize(feat_B.float(), p=2, dim=-1)
         sim_matrix = torch.bmm(norm_A, norm_B.transpose(1, 2)) / temp
         prob_A_to_B = F.softmax(sim_matrix, dim=-1)  # fp32
-        
 
-        # 期望特征（用于置信度估计）
-        refined_warp_coarse, match_entropy, sim_matrix = self.peak_aware_layer(
-            feat_A, feat_B, pos_A, pos_B, Hc, Wc
-        )
-        expected_feat_B = torch.bmm(prob_A_to_B.to(feat_B.dtype), feat_B)
-        feat_diff = torch.abs(feat_A - expected_feat_B)
-        feat_prod = feat_A * expected_feat_B
-        
+        # 提前提取分类特征
         top2_vals = torch.topk(prob_A_to_B, k=2, dim=-1).values
         top1_prob = top2_vals[..., 0:1]
         top2_prob = top2_vals[..., 1:2]
         margin = top1_prob - top2_prob
         entropy = -(prob_A_to_B * torch.log(prob_A_to_B.clamp_min(1e-8))).sum(dim=-1, keepdim=True)
-        
+
+        pos_B_for_geo = pos_B
+        with torch.no_grad():  # 纯几何计算，不干扰主干梯度
+            if H_prior is None:
+                # 方案 A：网络内部自适应估算初始 H_prior (零外部依赖)
+                expected_pos_B = torch.bmm(prob_A_to_B.to(dtype), pos_B)
+                # 使用最高置信度的区域算出大体的仿射/透视形变
+                H_to_invert = solve_weighted_dlt(pos_A.detach(), expected_pos_B.detach(), margin.detach())
+            else:
+                # 方案 B：使用外部传入的先验
+                H_to_invert = H_prior
+
+            # 求逆矩阵：将 B 图的物理网格强行投影回 A 图所在的无畸变共面空间
+            try:
+                H_inv = torch.linalg.inv(H_to_invert.float())
+            except RuntimeError:
+                H_inv = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).expand(B, -1, -1)
+
+            pb_homo = torch.cat([pos_B.float(), torch.ones(B, Hc * Wc, 1, device=device, dtype=torch.float32)], dim=-1)
+            pb_in_A = torch.bmm(pb_homo, H_inv.transpose(1, 2))
+            # 同样加入 clamp 防止极端情况除 0 导致崩溃
+            pos_B_for_geo = (pb_in_A[..., :2] / pb_in_A[..., 2:3].clamp(min=1e-5)).to(dtype)
+
+        # 将经过消除透视/旋转畸变后的基准坐标传给 PeakAwareLayer
+        refined_warp_coarse, match_entropy, sim_matrix = self.peak_aware_layer(
+            feat_A, feat_B, pos_A, pos_B, Hc, Wc, temp, pos_B_for_geo=pos_B_for_geo
+        )
+
+        expected_feat_B = torch.bmm(prob_A_to_B.to(feat_B.dtype), feat_B)
+        feat_diff = torch.abs(feat_A - expected_feat_B)
+        feat_prod = feat_A * expected_feat_B
+
         warp_AB_coarse = refined_warp_coarse.reshape(B, Hc, Wc, 2)
-        
+
         # Confidence
         conf_input = torch.cat(
             [feat_diff, feat_prod, top1_prob, top2_prob, margin, entropy],
@@ -592,18 +601,12 @@ class AgriTPSStitcher(nn.Module):
         super().__init__()
         self.matcher = AgriMatcher(**matcher_config)
         self.tps_estimator = BypassTPSEstimator(**tps_config)
-        self._grid_cache = {}
+        self.gs = tps_config['grid_size'] # 提取 grid_size
 
-        # 初始化 TPS 网格生成器
-        self.grid_gen = TPSGridGenerator(
-            grid_size=tps_config['grid_size'],
-            target_height=512,
-            target_width=512
-        )
+        self.grid_gen = TPSGridGenerator(grid_size=self.gs)
 
-    def forward(self, img_A, img_B):
-        # 1. 匹配器输出 (特征分辨率，例如 128x128)
-        m_out = self.matcher(img_A, img_B)
+    def forward(self, img_A, img_B, H_prior=None):
+        m_out = self.matcher(img_A, img_B, H_prior=H_prior)
         warp_AB = m_out['warp_AB']
         conf_AB = m_out['confidence_AB']
 
@@ -611,36 +614,25 @@ class AgriTPSStitcher(nn.Module):
         device = warp_AB.device
         dtype = warp_AB.dtype
 
-        # 提取真实图像的全分辨率 (例如 512x512)
+        # 提取真实图像的全分辨率
         H_img, W_img = img_A.shape[2], img_A.shape[3]
 
-        # ---------------------------------------------------------
-        # 阶段 A：在特征分辨率下估算全局 H 矩阵 (节省计算量)
-        # ---------------------------------------------------------
-        grid_A_feat = make_grid(B, H_feat, W_feat, device, dtype)  # [B, 128, 128, 2]
+        grid_A_feat = make_grid(B, H_feat, W_feat, device, dtype)
         src_pts_feat = grid_A_feat.reshape(B, -1, 2)
         dst_pts_feat = warp_AB.reshape(B, -1, 2)
         weights_feat = conf_AB.reshape(B, -1, 1)
 
-        # 采用重构后的高稳定性 DLT 或 4 点参数化求解器
-        H_mat = solve_weighted_dlt(src_pts_feat[:, ::16], dst_pts_feat[:, ::16], weights_feat[:, ::16])
+        # 求解高稳定性单应性矩阵
+        H_mat = solve_weighted_dlt(src_pts_feat, dst_pts_feat, weights_feat)
 
-        # ---------------------------------------------------------
-        # 阶段 B：在全分辨率下进行基准网格 (Base Grid) 投影
-        # ---------------------------------------------------------
-        grid_A_img = make_grid(B, H_img, W_img, device, dtype)  # [B, 512, 512, 2]
+        # 生成全分辨率的全局单应性网格 (Base Grid)
+        grid_A_img = make_grid(B, H_img, W_img, device, dtype)
         src_pts_img = grid_A_img.reshape(B, -1, 2)
-
-        ones = torch.ones(B, H_img * W_img, 1, device=device, dtype=dtype)
-        coords_homo = torch.cat([src_pts_img, ones], dim=-1)  # [B, N_img, 3]
-        projected_homo = torch.bmm(coords_homo, H_mat.transpose(1, 2))
-
-        # 获得全分辨率的全局单应性网格
+        ones_img = torch.ones(B, H_img * W_img, 1, device=device, dtype=dtype)
+        coords_homo_img = torch.cat([src_pts_img, ones_img], dim=-1)
+        projected_homo = torch.bmm(coords_homo_img, H_mat.transpose(1, 2))
         base_grid = (projected_homo[..., :2] / (projected_homo[..., 2:3] + 1e-8)).reshape(B, H_img, W_img, 2)
 
-        # ---------------------------------------------------------
-        # 阶段 C：在全分辨率下生成 TPS 残差网格
-        # ---------------------------------------------------------
         hc_wc = m_out.get('coarse_hw')
         tps_out = self.tps_estimator(
             warp_AB=warp_AB,
@@ -651,21 +643,36 @@ class AgriTPSStitcher(nn.Module):
             warp_AB_coarse=m_out['warp_AB_coarse'],
             coarse_hw=hc_wc
         )
+        delta_cp_total = tps_out['delta_cp'] # [B, 2, gs, gs] 预测的总偏移
 
-        # 核心修复：直接使用图像真实尺寸 (H_img, W_img) 喂给 TPSGridGenerator
-        dense_grid_res = self.grid_gen(tps_out['delta_cp'], target_shape=(H_img, W_img))
+        y_cp = torch.linspace(-1.0 + 1.0 / self.gs, 1.0 - 1.0 / self.gs, self.gs, device=device, dtype=dtype)
+        x_cp = torch.linspace(-1.0 + 1.0 / self.gs, 1.0 - 1.0 / self.gs, self.gs, device=device, dtype=dtype)
+        gy, gx = torch.meshgrid(y_cp, x_cp, indexing='ij')
+        p_src = torch.stack([gx, gy], dim=-1).reshape(1, -1, 2).expand(B, -1, -1)
 
-        # 融合得到全分辨率的最终网格
-        final_grid = base_grid + (dense_grid_res - grid_A_img)
+        ones_cp = torch.ones(B, self.gs * self.gs, 1, device=device, dtype=dtype)
+        p_src_homo_coords = torch.cat([p_src, ones_cp], dim=-1) # [B, N_cp, 3]
+        p_homo_proj = torch.bmm(p_src_homo_coords, H_mat.transpose(1, 2))
+        p_homo = p_homo_proj[..., :2] / (p_homo_proj[..., 2:3] + 1e-8) # [B, N_cp, 2]
 
-        # 训练时：折叠惩罚检查现在也可以在最高分辨率下执行，检测更精准
+        p_target_total = p_src + delta_cp_total.reshape(B, 2, -1).permute(0, 2, 1)
+        delta_cp_local = p_target_total - p_homo # [B, N_cp, 2]
+
+        delta_cp_local_4d = delta_cp_local.permute(0, 2, 1).reshape(B, 2, self.gs, self.gs)
+        # grid_gen 返回的是 (源网格 + 局部残差插值)，所以需要减去源网格得到纯粹的 flow
+        tps_local_grid = self.grid_gen(delta_cp_local_4d, target_shape=(H_img, W_img))
+        tps_residual_flow = tps_local_grid - grid_A_img # [B, H_img, W_img, 2]
+
+        final_grid = base_grid + tps_residual_flow
+
         if self.training:
-            fold_info = self.tps_estimator.folding(tps_out['delta_cp'], final_grid)
+            # 这里的折叠惩罚依然基于总的 delta_cp 计算，这能有效防止最终的网格发生拓扑反转
+            fold_info = self.tps_estimator.folding(delta_cp_total, final_grid)
             tps_out.update(fold_info)
 
         return {
             'dense_grid': final_grid,
-            'delta_cp': tps_out['delta_cp'],
+            'delta_cp': delta_cp_total,
             'matcher_out': m_out,
             'H_mat': H_mat,
             'tps_out': tps_out
@@ -902,7 +909,9 @@ class DistillationLoss(nn.Module):
         sim_matrix = stu_output.get("sim_matrix")
         if sim_matrix is not None and sim_matrix.shape[1] == N_coarse:
             teacher_prob_c = self._warp_to_prob(teacher_warp_c, Hc, Wc)
-            log_prob = F.log_softmax(sim_matrix, dim=-1).float()
+            KL_TEMP = 0.1  # 固定值，不随学习变化；控制蒸馏目标的分布锐利程度
+            sim_for_kl = sim_matrix.detach().float()  # .detach() 防止梯度回传到温度参数
+            log_prob = F.log_softmax(sim_for_kl / KL_TEMP, dim=-1)
             target_prob = teacher_prob_c.detach().float()
             kl_map = F.kl_div(log_prob, target_prob, reduction="none").sum(dim=-1)
             
@@ -947,79 +956,6 @@ class DistillationLoss(nn.Module):
             "loss_conf_refine": float(loss_conf_refine.detach().item()),
             "loss_smooth_coarse": float(loss_smooth_coarse.detach().item()),
             "loss_smooth_refine": float(loss_smooth_refine.detach().item()),
-        }
-
-
-class AgriTPSLoss(nn.Module):
-    def __init__(self, lambda_smooth: float = 10.0, epsilon: float = 1e-3):
-        super().__init__()
-        self.lambda_smooth = lambda_smooth
-        self.epsilon = epsilon
-
-    def charbonnier_loss(self, diff: torch.Tensor) -> torch.Tensor:
-        """鲁棒惩罚函数"""
-        return torch.sqrt(diff ** 2 + self.epsilon ** 2)
-
-    def compute_photometric_loss(self, img_A: torch.Tensor, warped_img_B: torch.Tensor, 
-                                 mask: torch.Tensor, confidence: torch.Tensor) -> torch.Tensor:
-        """
-        img_A, warped_img_B: (B, 3, H, W)
-        mask: (B, 1, H, W) 重叠区掩码
-        confidence: (B, 1, H, W) AgriMatcher 输出的置信度图
-        """
-        # 计算像素级差异
-        diff = img_A - warped_img_B
-        charb_diff = self.charbonnier_loss(diff) # (B, 3, H, W)
-        
-        # 沿通道维度求均值
-        charb_diff = charb_diff.mean(dim=1, keepdim=True) # (B, 1, H, W)
-        
-        # 计算综合权重
-        weight = mask * confidence
-        
-        # 加权求和并归一化
-        loss = torch.sum(charb_diff * weight) / (torch.sum(weight) + 1e-6)
-        return loss
-
-    def compute_smoothness_loss(self, delta_C: torch.Tensor) -> torch.Tensor:
-        """
-        计算二阶网格平滑损失
-        delta_C: (B, 2, grid_h, grid_w) GridNet 输出的控制点偏移
-        """
-        # 水平方向二阶差分: C[i, j+1] - 2C[i, j] + C[i, j-1]
-        diff_x = delta_C[:, :, :, 2:] - 2 * delta_C[:, :, :, 1:-1] + delta_C[:, :, :, :-2]
-        
-        # 垂直方向二阶差分: C[i+1, j] - 2C[i, j] + C[i-1, j]
-        diff_y = delta_C[:, :, 2:, :] - 2 * delta_C[:, :, 1:-1, :] + delta_C[:, :, :-2, :]
-        
-        loss_x = torch.mean(diff_x ** 2)
-        loss_y = torch.mean(diff_y ** 2)
-        
-        return loss_x + loss_y
-
-    def forward(self, img_A: torch.Tensor, warped_img_B: torch.Tensor, 
-                delta_C: torch.Tensor, confidence: torch.Tensor) -> dict:
-        
-        # 自动计算有效重叠区掩码 (假设无像素区域为绝对 0)
-        # 考虑到差值容差，只要 img_A 或 warped_img_B 有像素即可
-        mask_A = (img_A.sum(dim=1, keepdim=True) > 0).float()
-        mask_B = (warped_img_B.sum(dim=1, keepdim=True) > 0).float()
-        overlap_mask = mask_A * mask_B
-
-        # 如果 confidence 尺寸不匹配 (如 64x64)，需上采样到全图尺寸
-        if confidence.shape[-2:] != img_A.shape[-2:]:
-            confidence = F.interpolate(confidence, size=img_A.shape[-2:], mode='bilinear', align_corners=False)
-
-        # 计算各项损失
-        loss_photo = self.compute_photometric_loss(img_A, warped_img_B, overlap_mask, confidence)
-        loss_smooth = self.compute_smoothness_loss(delta_C)
-
-        total_loss = loss_photo + self.lambda_smooth * loss_smooth
-
-        return {
-            "total": total_loss,
-            "photo": loss_photo,
-            "smooth": loss_smooth
         }
 
 if __name__ == "__main__":

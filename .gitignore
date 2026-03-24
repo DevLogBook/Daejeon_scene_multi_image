@@ -97,6 +97,7 @@ debug/
 
 dense_match/RoMaV2/
 backbones/facebookresearch_dinov3*/
+teacher_cache/
 
 ############################
 # CUDA build artifacts

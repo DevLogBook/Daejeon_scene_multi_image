@@ -45,7 +45,6 @@ def main():
         if k in out:
             print(f"{k}: {_fmt(out[k])}")
 
-    # 如果你的 TPS 配置在别处（训练脚本）定义，这里只做一次最小实例化演示
     stitcher = AgriTPSStitcher(
         matcher_config=dict(d_model=128, teacher_dim=100, grid_size=32),
         tps_config=dict(

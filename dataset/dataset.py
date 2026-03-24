@@ -17,12 +17,11 @@ class MultiScaleDataset(Dataset):
     def __init__(
             self,
             pairs_file: Path,
-            is_train: bool = True,
             val_ratio: float = 0.1,
             split_seed: int = 42,
             return_split: str = 'train',
     ):
-        self.is_train = is_train
+        self.is_train = (return_split == 'train')
         self.return_split = return_split
 
         all_items: List[Tuple[Path, Path]] = []
@@ -58,7 +57,7 @@ class MultiScaleDataset(Dataset):
 
         # 尺寸池
         self.pool_lowres = [(256, 256), (384, 384), (512, 512), (384, 512), (512, 384)]
-        self.pool_highres = [(512, 768), (768, 512), (512, 512), (640, 480), (480, 640)]
+        self.pool_highres = [(512, 512), (640, 480), (480, 480)]
 
         # 预构建 transforms
         self.transforms_lowres = {
@@ -70,11 +69,16 @@ class MultiScaleDataset(Dataset):
             for h, w in self.pool_highres
         }
         self.color_norm_transform = A.Compose([
-            A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8),
+            A.ColorJitter(
+                brightness=0.1,  # 亮度微调 ±10% (模拟云层遮挡或轻微的顺/逆光)
+                contrast=0.1,  # 对比度微调 ±10% (模拟光照强弱造成的反差变化)
+                saturation=0.1,  # 饱和度微调 ±10% (保持植被色彩不过于鲜艳或灰暗)
+                hue=0.03,  # 色相极微调 ±3% (必须严格限制，防止植被颜色失真)
+                p=0.3  # 维持 50% 的触发概率，保证一半的数据是原图分布
+            ),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2()
         ])
-
         self.val_color_norm = A.Compose([
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2()
@@ -128,7 +132,79 @@ class MultiScaleDataset(Dataset):
 
         geo_transformed = transform(image=img_a, image_b=img_b)
         color_trans = self.val_color_norm if self.return_split == 'val' else self.color_norm_transform
-        tensor_a = color_trans(image=geo_transformed["image"])["image"]
-        tensor_b = color_trans(image=geo_transformed["image_b"])["image"]
+        random_num = random.randint(1, 11)
+        if random_num % 4 == 0:
+            tensor_a = color_trans(image=geo_transformed["image"])["image"]
+            tensor_b = color_trans(image=geo_transformed["image_b"])["image"]
+        else:
+            tensor_a = self.color_norm_transform(image=geo_transformed["image"])["image"]
+            tensor_b = self.color_norm_transform(image=geo_transformed["image_b"])["image"]
 
         return {"img_a": tensor_a, "img_b": tensor_b}
+
+
+class CachedTeacherDataset(Dataset):
+    def __init__(
+            self,
+            cache_dir: str,
+            val_ratio: float = 0.1,
+            split_seed: int = 42,
+            return_split: str = 'train'
+    ):
+        """
+        基于预计算缓存的 Dataset，支持稳定、确定性的 Train/Val 划分。
+        """
+        self.return_split = return_split
+        self.is_train = (return_split == 'train')
+
+        # 获取所有缓存文件并排序，确保在不同操作系统下顺序一致
+        all_files = sorted(list(Path(cache_dir).glob("*.pt")))
+        if len(all_files) == 0:
+            raise ValueError(f"No cache files found in {cache_dir}")
+
+        # 使用局部独立的随机数生成器进行打乱，不污染全局 Seed
+        rng = random.Random(split_seed)
+        rng.shuffle(all_files)
+
+        val_size = max(1, int(len(all_files) * val_ratio))
+        if self.is_train:
+            self.cache_files = all_files[val_size:]
+        else:
+            self.cache_files = all_files[:val_size]
+
+        print(f"[{return_split.upper()} Set] Loaded {len(self.cache_files)} cached items.")
+
+        if self.is_train:
+            # 训练集：包含温和的色彩抖动，提升光照鲁棒性
+            self.online_transform = A.Compose([
+                A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.03, p=0.5),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2()
+            ], additional_targets={'image_b': 'image'})
+        else:
+            # 验证集：绝对禁止色彩抖动，仅做标准化和张量化，确保验证指标稳定可靠
+            self.online_transform = A.Compose([
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2()
+            ], additional_targets={'image_b': 'image'})
+
+    def __len__(self):
+        return len(self.cache_files)
+
+    def __getitem__(self, idx):
+        cache_data = torch.load(self.cache_files[idx])
+
+        # 执行线上 Transform (自动区分 Train/Val)
+        aug_out = self.online_transform(
+            image=cache_data['img_a'],
+            image_b=cache_data['img_b']
+        )
+
+        return {
+            "img_a": aug_out['image'],
+            "img_b": aug_out['image_b'],
+            "t_warp_AB": cache_data['warp_AB'].float(),
+            "t_conf_AB": cache_data['confidence_AB'].float(),
+            "t_feat_a": cache_data['feat_A'].float(),
+            "t_feat_b": cache_data['feat_B'].float(),
+        }
