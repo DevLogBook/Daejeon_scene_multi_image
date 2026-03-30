@@ -177,26 +177,13 @@ class DWConvGNAct(nn.Module):
         return x + r
 
 
-# WarpRefiner
 class WarpRefiner(nn.Module):
-    """
-    轻量级两级匹配的 refine block
-    输入:
-      feat_A: (B, C, H, W)
-      feat_B: (B, C, H, W)
-      prev_warp: (B, H, W, 2)  normalized coords (x,y) in [-1,1] with align_corners=False convention
-      prev_overlap: (B, H, W) or (B, H, W, 1)
-    输出:
-      warp: (B, H, W, 2)
-      overlap_logits: (B, H, W, 1)
-      overlap: (B, H, W, 1)
-    """
     def __init__(
         self,
         C: int,
         hidden: int = 96,
         num_blocks: int = 2,
-        delta_scale: float = 0.25,
+        max_pixel_delta: int = 4,   # ← 改为像素数上限，而非固定归一化值
         residual_overlap: bool = True,
         corr_radius: int = 2
     ):
@@ -206,12 +193,11 @@ class WarpRefiner(nn.Module):
         self.C = C
         self.hidden = hidden
         self.num_blocks = num_blocks
-        self.delta_scale = float(delta_scale)
+        self.max_pixel_delta = max_pixel_delta   # 最大修正像素数
         self.residual_overlap = bool(residual_overlap)
-        
-        in_ch = 4 * C + 5 + corr_channels
+
+        in_ch = 4 * C + 5 + corr_channels + 2
         self.stem = ConvGNAct(in_ch, hidden, k=1, s=1, p=0)
-        # self.blocks = nn.Sequential(*[DWConvGNAct(hidden, expansion=2) for _ in range(num_blocks)])
         self.blocks = nn.Sequential(
             DWConvGNAct(hidden, expansion=2),
             ConvGNAct(hidden, hidden, k=3, dilation=2),
@@ -231,18 +217,13 @@ class WarpRefiner(nn.Module):
         feat_B: torch.Tensor,
         prev_warp: torch.Tensor,
         prev_overlap: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        
+    ):
         B, C, H, W = feat_A.shape
         H_target, W_target = prev_warp.shape[1], prev_warp.shape[2]
 
-        # Robustness: in some call paths `prev_warp/prev_overlap` may come from a different scale.
-        # `grid_sample` and the concatenation below require matching spatial sizes.
         if (H_target, W_target) != (H, W):
             prev_warp, prev_overlap = upsample_warp_and_overlap(
-                prev_warp,
-                prev_overlap,
-                out_hw=(H, W),
+                prev_warp, prev_overlap, out_hw=(H, W),
             )
             H_target, W_target = H, W
 
@@ -259,38 +240,36 @@ class WarpRefiner(nn.Module):
 
         absdiff = (feat_A - sampled_B).abs()
         prod = feat_A * sampled_B
+        flow_chw = (prev_warp - src_grid).permute(0, 3, 1, 2).contiguous()
 
         x = torch.cat(
-            [feat_A, sampled_B, absdiff, prod, corr, 
-             prev_overlap_chw, prev_warp_chw, src_grid_chw],
+            [feat_A, sampled_B, absdiff, prod, corr,
+             prev_overlap_chw, prev_warp_chw, src_grid_chw, flow_chw],
             dim=1,
         )
         x = self.stem(x)
         x = self.blocks(x)
 
-        delta = self.delta_head(x)
-        delta = self.delta_scale * torch.tanh(delta)
-        if delta.shape[2] != H_target or delta.shape[3] != W_target:
-            delta = F.interpolate(
-                delta, 
-                size=(H_target, W_target), 
-                mode='bilinear', 
-                align_corners=False
-            )
-        delta = delta.permute(0, 2, 3, 1).contiguous()
+        # 动态 delta_scale：根据当前特征图分辨率计算归一化修正上限
+        # max_pixel_delta 个像素对应的归一化距离 = max_pixel_delta * (2/H)
+        # 对 H 和 W 取较小值，保守约束
+        delta_scale = self.max_pixel_delta * (2.0 / min(H, W))
 
+        delta = self.delta_head(x)
+        delta = delta_scale * torch.tanh(delta)  # 修正量被约束在 ±max_pixel_delta 像素以内
+
+        if delta.shape[2] != H_target or delta.shape[3] != W_target:
+            delta = F.interpolate(delta, size=(H_target, W_target),
+                                  mode='bilinear', align_corners=False)
+        delta = delta.permute(0, 2, 3, 1).contiguous()
         refined_warp = prev_warp + delta
 
         ov_delta = self.ov_head(x)
         if ov_delta.shape[2] != H_target or ov_delta.shape[3] != W_target:
-            ov_delta = F.interpolate(
-                ov_delta, 
-                size=(H_target, W_target), 
-                mode='bilinear', 
-                align_corners=False
-            )
-    
+            ov_delta = F.interpolate(ov_delta, size=(H_target, W_target),
+                                     mode='bilinear', align_corners=False)
         ov_delta = ov_delta.permute(0, 2, 3, 1).contiguous()
+
         if self.residual_overlap:
             if prev_overlap.ndim == 3:
                 prev_overlap = prev_overlap.unsqueeze(-1)
@@ -300,29 +279,27 @@ class WarpRefiner(nn.Module):
             overlap_logits = ov_delta
 
         overlap = torch.sigmoid(overlap_logits)
-
         return refined_warp, overlap_logits, overlap
 
 
-def ssim_map(img1, img2, mask, window_size=11, sigma=1.5):
+def ssim_map(img1, img2, mask, window_size=7, sigma=1.5):
     _, C, H, W = img1.shape
     device = img1.device
 
-    # 准备高斯窗口
     def gaussian(window_size, sigma):
         gauss = torch.exp(-(torch.arange(window_size).float() - window_size // 2) ** 2 / (2 * sigma ** 2))
         return gauss / gauss.sum()
 
-    _1D_window = gaussian(window_size, sigma).unsqueeze(1).to(device, img1.dtype)
-    window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+    _1D_window = gaussian(window_size, sigma).unsqueeze(1).to(device=device, dtype=torch.float32)  # 显式 fp32
+    window = _1D_window.mm(_1D_window.t()).unsqueeze(0).unsqueeze(0)
     window = window.expand(C, 1, window_size, window_size).contiguous()
 
-    # 2. 预计算 Mask 的卷积权重（用于归一化均值）
+    # 预计算 Mask 的卷积权重（用于归一化均值）
     # mask 形状假设为 [B, 1, H, W]
     mask_weight = F.conv2d(mask.expand(-1, C, -1, -1), window, padding=window_size // 2, groups=C)
     mask_weight = mask_weight.clamp(min=1e-6)  # 避免除零
 
-    # 3. 计算归一化均值 mu = E[x] = conv(img * mask) / conv(mask)
+    # 计算归一化均值 mu = E[x] = conv(img * mask) / conv(mask)
     mu1 = F.conv2d(img1 * mask, window, padding=window_size // 2, groups=C) / mask_weight
     mu2 = F.conv2d(img2 * mask, window, padding=window_size // 2, groups=C) / mask_weight
 
@@ -330,7 +307,7 @@ def ssim_map(img1, img2, mask, window_size=11, sigma=1.5):
     mu2_sq = mu2.pow(2)
     mu1_mu2 = mu1 * mu2
 
-    # 4. 计算归一化方差 sigma^2 = E[x^2] - (E[x])^2
+    # 计算归一化方差 sigma^2 = E[x^2] - (E[x])^2
     # E[x^2] = conv(img^2 * mask) / conv(mask)
     sigma1_sq = F.conv2d((img1 * img1) * mask, window, padding=window_size // 2, groups=C) / mask_weight - mu1_sq
     sigma2_sq = F.conv2d((img2 * img2) * mask, window, padding=window_size // 2, groups=C) / mask_weight - mu2_sq
@@ -363,47 +340,55 @@ def compute_cycle_loss(warp_AB, warp_BA, conf_A):
     return (cycle_dist * conf_A).mean()
 
 
-def compute_photometric_loss(img_a, img_b, dense_grid, confidence, alpha=0.85):
-    """
-    高精度光度损失：支持 512x512 细碎纹理对齐
-    """
+def compute_photometric_loss(img_a, img_b, dense_grid, confidence,
+                              use_ssim: bool = False, alpha: float = 0.85):
+    assert img_a.dtype == torch.float32, f"img_a dtype={img_a.dtype}, expected float32"
+    assert img_b.dtype == torch.float32, f"img_b dtype={img_b.dtype}, expected float32"
     B, C, H, W = img_a.shape
     device = img_a.device
 
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    img_a_f = img_a.float()
+    img_b_f = img_b.float()
+    dense_grid_f = dense_grid.float()
 
-    img_a_raw = (img_a * std + mean).clamp(0, 1)
-    img_b_raw = (img_b * std + mean).clamp(0, 1)
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=torch.float32).view(1, 3, 1, 1)
 
-    # 采样 warped 图 (使用反归一化后的图像)
-    warped_b = F.grid_sample(img_b_raw, dense_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+    img_a_raw = (img_a_f * std + mean).clamp(0, 1)
+    img_b_raw = (img_b_f * std + mean).clamp(0, 1)
+
+    warped_b = F.grid_sample(img_b_raw, dense_grid_f, mode='bilinear',
+                              padding_mode='zeros', align_corners=False)
 
     target_hw = warped_b.shape[-2:]
-    if img_a.shape[-2:] != target_hw:
+    if img_a_raw.shape[-2:] != target_hw:
         img_curr = F.interpolate(img_a_raw, size=target_hw, mode='bilinear', align_corners=False)
     else:
         img_curr = img_a_raw
 
-    # 生成有效重叠掩码
-    ones = torch.ones((B, 1, *target_hw), device=device, dtype=img_a.dtype)
-    mask = F.grid_sample(ones, dense_grid, mode='nearest', padding_mode='zeros', align_corners=False)
-    mask = (mask > 0.9).float()
+    ones = torch.ones((B, 1, *target_hw), device=device, dtype=torch.float32)
+    mask = F.grid_sample(ones, dense_grid_f, mode='nearest',
+                          padding_mode='zeros', align_corners=False)
+    mask = (mask > 0.9).float().detach()
 
     l1_map = torch.abs(img_curr - warped_b).mean(dim=1, keepdim=True)
-    s_map = ssim_map(img_curr, warped_b, mask)
-    ssim_loss_map = 1 - s_map.mean(dim=1, keepdim=True)
 
-    photo_loss_map = alpha * ssim_loss_map + (1 - alpha) * l1_map
+    if use_ssim:
+        s_map = ssim_map(img_curr, warped_b, mask)
+        ssim_loss_map = 1.0 - s_map.mean(dim=1, keepdim=True)
+        photo_loss_map = alpha * ssim_loss_map + (1.0 - alpha) * l1_map
+    else:
+        photo_loss_map = l1_map
 
     # 置信度对齐
-    if confidence.ndim == 3: confidence = confidence.unsqueeze(1)
-    if confidence.shape[-2:] != target_hw:
-        conf = F.interpolate(confidence, size=target_hw, mode="bilinear", align_corners=False)
-    else:
-        conf = confidence
+    conf = confidence.float()
+    if conf.ndim == 3:
+        conf = conf.unsqueeze(1)
+    if conf.shape[-2:] != target_hw:
+        conf = F.interpolate(conf, size=target_hw, mode='bilinear', align_corners=False)
 
-    total_weight = conf * mask
+    total_weight = (conf * mask).detach() if use_ssim else mask.detach()
+
     return (photo_loss_map * total_weight).sum() / (total_weight.sum() + 1e-6)
 
 

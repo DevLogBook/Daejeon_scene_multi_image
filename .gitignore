@@ -91,10 +91,6 @@ debug/
 # External repositories (optional)
 ############################
 
-# 如果你打算用 submodule 管理
-# 就不要忽略
-# 如果只是复制代码，建议忽略
-
 dense_match/RoMaV2/
 backbones/facebookresearch_dinov3*/
 teacher_cache/

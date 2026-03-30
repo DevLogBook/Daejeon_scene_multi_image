@@ -15,6 +15,7 @@ if platform.system() == 'Windows':
 import cv2
 import numpy as np
 import matplotlib.cm as cm
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,7 +23,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 
-torch.set_float32_matmul_precision('highest')
+torch.set_float32_matmul_precision('high')
 REPO_ROOT = Path(__file__).resolve().parent
 ROMA_SRC = REPO_ROOT / "RoMaV2" / "src"
 
@@ -40,12 +41,18 @@ from dense_match.refine import (
     compute_cycle_consistency_loss,
 )
 
-from dataset.dataset import MultiScaleDataset, CachedTeacherDataset
+from dataset.dataset import (
+    MultiScaleDataset,
+    CachedTeacherDataset,
+    BucketedBatchSampler,
+    BucketedH5TeacherDataset,
+)
 
 if str(ROMA_SRC) not in sys.path:
     sys.path.insert(0, str(ROMA_SRC))
 from romav2 import RoMaV2  # pyright: ignore[reportMissingImports]
 
+torch.backends.cuda.enable_flash_sdp(True)
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -212,6 +219,16 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
         grid_vis = plot_grid_to_image(dense_grid, (H_target, W_target))
         overlay_vis = blended_vis[0] * 0.7 + grid_vis * 0.3
 
+        geo_scores = matcher_out.get('geo_scores')
+        top1_prob = matcher_out.get('top1_prob')
+        if geo_scores is not None and top1_prob is not None:
+            Hc, Wc = matcher_out['coarse_hw']
+            geo_map = geo_scores.mean(dim=-1).reshape(-1, Hc, Wc)[0:1]
+            writer.add_image('Debug/geo_scores', colorize_heatmap(geo_map), step)
+
+            top1_map = top1_prob.reshape(-1, Hc, Wc)[0:1]
+            writer.add_image('Debug/top1_prob', colorize_heatmap(top1_map), step)
+
         # 组装面板 (全部都在 CPU，尺寸均为 H_target x W_target)
         row1 = torch.cat([img_a_vis[0], img_b_vis[0], warped_b_vis[0], checker_vis[0]], dim=2)
         row2 = torch.cat([conf_color, diff_vis[0], grid_vis, overlay_vis], dim=2)
@@ -255,20 +272,37 @@ def multi_scale_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, Li
 
 
 def cached_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """
-    CachedTeacherDataset 专用 collate。
-    每个样本的空间尺寸已在预计算时固定，可以直接 stack。
-    teacher 信号同样一起 stack，免去训练循环内的手动拼装。
-    """
     if len(batch) == 0:
         return {}
+
+    # 初始化列表（关键缺失）
+    img_a_list, img_b_list = [], []
+    t_warp_AB_list, t_conf_AB_list = [], []
+    t_feat_a_list, t_feat_b_list = [], []
+
+    target_h, target_w = batch[0]['img_a'].shape[-2:]
+
+    for item in batch:
+        a, b = item['img_a'], item['img_b']
+        if a.shape[-2:] != (target_h, target_w):
+            a = F.interpolate(a.unsqueeze(0), size=(target_h, target_w),
+                              mode='bilinear', align_corners=False).squeeze(0)
+            b = F.interpolate(b.unsqueeze(0), size=(target_h, target_w),
+                              mode='bilinear', align_corners=False).squeeze(0)
+        img_a_list.append(a)
+        img_b_list.append(b)
+        t_warp_AB_list.append(item['t_warp_AB'])
+        t_conf_AB_list.append(item['t_conf_AB'])
+        t_feat_a_list.append(item['t_feat_a'])
+        t_feat_b_list.append(item['t_feat_b'])
+
     return {
-        'img_a': torch.stack([item['img_a'] for item in batch]),
-        'img_b': torch.stack([item['img_b'] for item in batch]),
-        't_warp_AB': torch.stack([item['t_warp_AB'] for item in batch]),
-        't_conf_AB': torch.stack([item['t_conf_AB'] for item in batch]),
-        't_feat_a': torch.stack([item['t_feat_a'] for item in batch]),
-        't_feat_b': torch.stack([item['t_feat_b'] for item in batch]),
+        'img_a': torch.stack(img_a_list),
+        'img_b': torch.stack(img_b_list),
+        't_warp_AB': torch.stack(t_warp_AB_list),
+        't_conf_AB': torch.stack(t_conf_AB_list),
+        't_feat_a': torch.stack(t_feat_a_list),
+        't_feat_b': torch.stack(t_feat_b_list),
     }
 
 
@@ -444,58 +478,255 @@ def load_checkpoint(
     )
 
 
+# @torch.no_grad()
+# def legacy_validate(student, val_loader, loss_fn, device, teacher_grid_size, max_batches=20):
+#     student.eval()
+#     total_fold = 0
+#     total_distill_loss = 0
+#     count = 0
+#
+#     for i, batch in enumerate(val_loader):
+#         if i >= max_batches:
+#             break
+#
+#         # 兼容两种 DataLoader：CachedTeacherDataset（tensor）和 MultiScaleDataset（list）
+#         if isinstance(batch['img_a'], torch.Tensor):
+#             img_a = batch['img_a'].to(device)
+#             img_b = batch['img_b'].to(device)
+#         else:
+#             img_a = torch.stack(batch['img_a']).to(device)
+#             img_b = torch.stack(batch['img_b']).to(device)
+#
+#         # 从缓存或实时推理获取 teacher 信号
+#         if 't_warp_AB' in batch:
+#             t_warp_AB = batch['t_warp_AB'].to(device)
+#             t_conf_AB = batch['t_conf_AB'].to(device)
+#             t_feat_a = batch['t_feat_a'].to(device)
+#             t_feat_b = batch['t_feat_b'].to(device)
+#             t_out = {
+#                 'warp_AB': t_warp_AB,
+#                 'confidence_AB': t_conf_AB,
+#                 'confidence_is_prob': True,
+#             }
+#         # else:
+#         #     with torch.inference_mode():
+#         #         img_a_lr, img_b_lr, img_a_hr, img_b_hr = make_teacher_inputs(img_a, img_b, teacher)
+#         #         t_out = teacher(img_a_lr, img_b_lr, img_a_hr, img_b_hr)
+#         #         t_feat_a, t_feat_b = extract_teacher_features_ds(
+#         #             teacher, img_a_lr, img_b_lr, teacher_grid_size
+#         #         )
+#         #         t_out['confidence_is_prob'] = False
+#
+#         stu_out = student(img_a, img_b)
+#
+#         d_loss = loss_fn(
+#             stu_output=stu_out['matcher_out'],
+#             teacher_warp=t_out['warp_AB'],
+#             teacher_conf=(
+#                 t_out['confidence_AB']
+#                 if t_out.get('confidence_is_prob', False)
+#                 else teacher_overlap_map(t_out['confidence_AB'])
+#             ),
+#             teacher_feat_A=t_feat_a,
+#             teacher_feat_B=t_feat_b,
+#         )
+#         total_distill_loss += d_loss['total'].item()
+#         total_fold += stu_out['tps_out'].get('fold_ratio', 0)
+#         count += 1
+#
+#     student.train()
+#     return {
+#         'total': total_distill_loss / count,
+#         'fold_ratio': total_fold / count,
+#     }
+
+
+def _prepare_teacher_targets(
+        batch: Dict[str, Any],
+        device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    if isinstance(batch['img_a'], torch.Tensor):
+        img_a = batch['img_a'].to(device, non_blocking=True)
+        img_b = batch['img_b'].to(device, non_blocking=True)
+    else:
+        img_a = torch.stack(batch['img_a']).to(device, non_blocking=True)
+        img_b = torch.stack(batch['img_b']).to(device, non_blocking=True)
+
+    if 't_warp_AB' not in batch:
+        raise RuntimeError("Online teacher inference is currently disabled. Please use --cache-dir with cached teacher supervision.")
+
+    t_warp_AB = batch['t_warp_AB'].to(device, non_blocking=True)
+    t_conf_AB = batch['t_conf_AB'].to(device, non_blocking=True)
+    t_feat_a = batch['t_feat_a'].to(device, non_blocking=True)
+    t_feat_b = batch['t_feat_b'].to(device, non_blocking=True)
+    t_out = {
+        'warp_AB': t_warp_AB,
+        'confidence_AB': t_conf_AB,
+        'confidence_is_prob': True,
+    }
+    return img_a, img_b, t_out, t_feat_a, t_feat_b
+
+
+def _compute_loss_bundle(
+        student: nn.Module,
+        img_a: torch.Tensor,
+        img_b: torch.Tensor,
+        t_out: Dict[str, torch.Tensor],
+        t_feat_a: torch.Tensor,
+        t_feat_b: torch.Tensor,
+        distill_loss_fn: DistillationLoss,
+        geo_loss_fn: LocalGeometricConsistency,
+        cfg: Dict[str, Any],
+        device: torch.device,
+        amp_enabled: bool,
+        current_epoch: int = 1,
+        ssim_warmup_epochs: int = 10,
+) -> Dict[str, Any]:
+    with torch.amp.autocast("cuda", enabled=amp_enabled):
+        stu_out = student(img_a, img_b)
+        stu_output = stu_out["matcher_out"]
+
+        final_grid = stu_out["dense_grid"]
+        conf_refine = stu_output['confidence_AB']
+        batch_size, height, width, _ = final_grid.shape
+        grid_full = make_grid(batch_size, height, width, final_grid.device, final_grid.dtype)
+        current_flow_final = final_grid - grid_full
+
+        if conf_refine.shape[-2:] != (height, width):
+            conf_for_geo = F.interpolate(
+                conf_refine.unsqueeze(1), size=(height, width), mode='bilinear', align_corners=False
+            ).squeeze(1)
+        else:
+            conf_for_geo = conf_refine
+
+        geo_loss = geo_loss_fn(current_flow_final, conf_for_geo)
+        d_loss = distill_loss_fn(
+            stu_output=stu_output,
+            teacher_warp=t_out["warp_AB"],
+            teacher_conf=(
+                t_out["confidence_AB"]
+                if t_out.get("confidence_is_prob", False)
+                else teacher_overlap_map(t_out["confidence_AB"])
+            ),
+            teacher_feat_A=t_feat_a,
+            teacher_feat_B=t_feat_b,
+        )
+
+        f_loss = stu_out["tps_out"].get("fold_loss", torch.zeros((), device=device))
+        if not torch.is_tensor(f_loss):
+            f_loss = torch.tensor(f_loss, device=device)
+
+        if "SELF_SUPERVISED" in cfg["phase"]:
+            noise_std = 0.02
+            noise_b = torch.randn_like(img_b) * noise_std
+            noise_a = torch.randn_like(img_a) * noise_std
+            b_min, b_max = img_b.min(), img_b.max()
+            a_min, a_max = img_a.min(), img_a.max()
+            img_b_noisy = (img_b + noise_b).clamp(b_min, b_max)
+            img_a_noisy = (img_a + noise_a).clamp(a_min, a_max)
+
+            stu_out_ba = student(img_b_noisy, img_a_noisy)
+            c_loss = compute_cycle_consistency_loss(stu_out, stu_out_ba)
+        else:
+            c_loss = torch.zeros((), device=device)
+
+        w = cfg["weights"]
+        total_loss_no_photo = (
+                w["distill"] * d_loss["total"]
+                + w["fold"] * f_loss
+                + w["cycle"] * c_loss
+                + w["geo"] * geo_loss
+        )
+    use_ssim_now = (current_epoch > ssim_warmup_epochs)
+    with torch.amp.autocast("cuda", enabled=False):
+        p_loss = compute_photometric_loss(
+            img_a.float(),
+            img_b.float(),
+            stu_out["dense_grid"].float(),
+            stu_out["matcher_out"]["confidence_AB"].float(),
+            use_ssim=use_ssim_now,
+            alpha=0.85,
+        )
+
+    total_loss = total_loss_no_photo + w["photo"] * p_loss
+
+    fold_ratio = stu_out["tps_out"].get("fold_ratio", 0.0)
+    if torch.is_tensor(fold_ratio):
+        fold_ratio = float(fold_ratio.detach().mean().item())
+    else:
+        fold_ratio = float(fold_ratio)
+
+    return {
+        'stu_out': stu_out,
+        'distill': d_loss["total"],
+        'fold': f_loss,
+        'photo': p_loss,
+        'cycle': c_loss,
+        'geo': geo_loss,
+        'total': total_loss,
+        'fold_ratio': fold_ratio,
+    }
+
+
 @torch.no_grad()
-def validate(student, teacher, val_loader, loss_fn, device, teacher_grid_size, max_batches=20):
+def validate(
+        student: nn.Module,
+        val_loader: DataLoader,
+        distill_loss_fn: DistillationLoss,
+        geo_loss_fn: LocalGeometricConsistency,
+        cfg: Dict[str, Any],
+        device: torch.device,
+        use_amp: bool,
+        max_batches: int = 20,
+        epoch: int = 0,
+) -> Dict[str, float]:
+    was_training = student.training
     student.eval()
-    total_fold = 0
-    total_distill_loss = 0
+    totals = {
+        'distill': 0.0,
+        'fold': 0.0,
+        'photo': 0.0,
+        'cycle': 0.0,
+        'geo': 0.0,
+        'total': 0.0,
+        'fold_ratio': 0.0,
+    }
     count = 0
 
     for i, batch in enumerate(val_loader):
         if i >= max_batches:
             break
 
-        # 兼容两种 DataLoader：CachedTeacherDataset（tensor）和 MultiScaleDataset（list）
-        if isinstance(batch['img_a'], torch.Tensor):
-            img_a = batch['img_a'].to(device)
-            img_b = batch['img_b'].to(device)
-        else:
-            img_a = torch.stack(batch['img_a']).to(device)
-            img_b = torch.stack(batch['img_b']).to(device)
-
-        # 从缓存或实时推理获取 teacher 信号
-        if 't_warp_AB' in batch:
-            t_warp_AB = batch['t_warp_AB'].to(device)
-            t_conf_AB = batch['t_conf_AB'].to(device)
-            t_feat_a = batch['t_feat_a'].to(device)
-            t_feat_b = batch['t_feat_b'].to(device)
-            t_out = {'warp_AB': t_warp_AB, 'confidence_AB': t_conf_AB}
-        else:
-            with torch.inference_mode():
-                img_a_lr, img_b_lr, img_a_hr, img_b_hr = make_teacher_inputs(img_a, img_b, teacher)
-                t_out = teacher(img_a_lr, img_b_lr, img_a_hr, img_b_hr)
-                t_feat_a, t_feat_b = extract_teacher_features_ds(
-                    teacher, img_a_lr, img_b_lr, teacher_grid_size
-                )
-
-        stu_out = student(img_a, img_b)
-
-        d_loss = loss_fn(
-            stu_output=stu_out['matcher_out'],
-            teacher_warp=t_out['warp_AB'],
-            teacher_conf=teacher_overlap_map(t_out['confidence_AB']),
-            teacher_feat_A=t_feat_a,
-            teacher_feat_B=t_feat_b,
+        img_a, img_b, t_out, t_feat_a, t_feat_b = _prepare_teacher_targets(batch, device)
+        loss_bundle = _compute_loss_bundle(
+            student=student,
+            img_a=img_a,
+            img_b=img_b,
+            t_out=t_out,
+            t_feat_a=t_feat_a,
+            t_feat_b=t_feat_b,
+            distill_loss_fn=distill_loss_fn,
+            geo_loss_fn=geo_loss_fn,
+            cfg=cfg,
+            device=device,
+            amp_enabled=use_amp,
+            current_epoch=epoch,
+            ssim_warmup_epochs=10,
         )
-        total_distill_loss += d_loss['total'].item()
-        total_fold += stu_out['tps_out'].get('fold_ratio', 0)
+        totals['distill'] += float(loss_bundle['distill'].detach().item())
+        totals['fold'] += float(loss_bundle['fold'].detach().item())
+        totals['photo'] += float(loss_bundle['photo'].detach().item())
+        totals['cycle'] += float(loss_bundle['cycle'].detach().item())
+        totals['geo'] += float(loss_bundle['geo'].detach().item())
+        totals['total'] += float(loss_bundle['total'].detach().item())
+        totals['fold_ratio'] += float(loss_bundle['fold_ratio'])
         count += 1
 
-    student.train()
-    return {
-        'total': total_distill_loss / count,
-        'fold_ratio': total_fold / count,
-    }
+    if was_training:
+        student.train()
+    if count == 0:
+        return totals
+    return {key: value / count for key, value in totals.items()}
 
 
 # 参数解析
@@ -512,7 +743,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--resume", type=Path, default=None)
 
     p.add_argument("--d-model", type=int, default=128)
-    p.add_argument("--teacher-dim", type=int, default=None)
     p.add_argument("--teacher-grid-size", type=int, default=32, help="Teacher 特征提取的 grid size")
 
     p.add_argument("--batch-size", type=int, default=4)
@@ -529,7 +759,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--teacher-compile", action="store_true")
 
     # Loss weights
-    p.add_argument("--alpha", type=float, default=0.2)
+    p.add_argument("--alpha", type=float, default=0.05)
     p.add_argument("--beta-coarse", type=float, default=1.0)
     p.add_argument("--beta-refine", type=float, default=1.5)
     p.add_argument("--gamma", type=float, default=0.05)
@@ -551,21 +781,21 @@ def build_argparser() -> argparse.ArgumentParser:
 def get_phase_config(epoch):
     keyframes = {
         1: {"phase": "DISTILL", "w": {"distill": 1.0, "fold": 0.0, "photo": 0.5, "cycle": 0.0, "geo": 0.1},
-            "train_aggregator": False},
+            "train_aggregator": False, "train_backbone": True},
         8: {"phase": "DISTILL", "w": {"distill": 1.0, "fold": 0.0, "photo": 0.5, "cycle": 0.0, "geo": 0.1},
-            "train_aggregator": False},
+            "train_aggregator": False, "train_backbone": True},
         10: {"phase": "TPS_REFINE",
-             "w": {"distill": 0.5, "fold": 0.5, "photo": 1.0, "cycle": 0.0, "geo": 1.0},
-             "train_aggregator": True},
+             "w": {"distill": 0.5, "fold": 0.5, "photo": 1.0, "cycle": 0.0, "geo": 0.5},
+             "train_aggregator": True, "train_backbone": False},
         15: {"phase": "TPS_REFINE",
-             "w": {"distill": 0.5, "fold": 1.0, "photo": 1.0, "cycle": 0.0, "geo": 1.0},
-             "train_aggregator": True},
+             "w": {"distill": 0.5, "fold": 1.0, "photo": 1.5, "cycle": 0.0, "geo": 0.2},
+             "train_aggregator": True, "train_backbone": False},
         17: {"phase": "SELF_SUPERVISED",
-             "w": {"distill": 0.1, "fold": 3.0, "photo": 2.0, "cycle": 1.0, "geo": 3.0},
-             "train_aggregator": True},
+             "w": {"distill": 0.3, "fold": 1.5, "photo": 2.0, "cycle": 1.0, "geo": 0.2},
+             "train_aggregator": True, "train_backbone": False},
         100: {"phase": "SELF_SUPERVISED",
-              "w": {"distill": 0.1, "fold": 3.0, "photo": 2.0, "cycle": 1.0, "geo": 3.0},
-              "train_aggregator": True},
+              "w": {"distill": 0.1, "fold": 1.5, "photo": 2.0, "cycle": 1.0, "geo": 0.2},
+              "train_aggregator": True, "train_backbone": False},
     }
 
     # 定位当前 Epoch 所在的插值区间 [e1, e2]
@@ -593,7 +823,7 @@ def get_phase_config(epoch):
     # 状态平滑切换
     # 只要开始向新阶段过渡(alpha > 0)，就立刻解冻对应的网络层，使其提前开始适应微小的梯度
     train_aggregator = kf2["train_aggregator"] if alpha > 0 else kf1["train_aggregator"]
-
+    train_backbone = kf2["train_backbone"] if alpha > 0 else kf1["train_backbone"]
     # 动态生成 Phase 监控名称
     if alpha == 0:
         phase_name = kf1["phase"]
@@ -606,7 +836,8 @@ def get_phase_config(epoch):
         "phase": phase_name,
         "weights": blended_weights,
         "train_aggregator": train_aggregator,
-        "train_matcher": True
+        "train_matcher": True,
+        "train_backbone": train_backbone,
     }
 
 
@@ -626,25 +857,61 @@ def main() -> None:
     writer = SummaryWriter(log_dir=str(args.log_dir))
 
     use_cache = args.cache_dir is not None and args.cache_dir.exists()
+    cache_loader_kwargs = {
+        "num_workers": args.num_workers,
+        "collate_fn": cached_collate_fn,
+        "pin_memory": True,
+    }
+    image_loader_kwargs = {
+        "num_workers": args.num_workers,
+        "collate_fn": multi_scale_collate_fn,
+        "pin_memory": True,
+    }
+    if args.num_workers > 0:
+        cache_loader_kwargs["persistent_workers"] = True
+        cache_loader_kwargs["prefetch_factor"] = 2
+        image_loader_kwargs["persistent_workers"] = True
+        image_loader_kwargs["prefetch_factor"] = 2
 
     if use_cache:
         print(f"[Dataset] 使用预计算缓存模式: {args.cache_dir}")
-        train_dataset = CachedTeacherDataset(
-            args.cache_dir, val_ratio=args.val_ratio, return_split='train'
-        )
-        val_dataset = CachedTeacherDataset(
-            args.cache_dir, val_ratio=args.val_ratio, return_split='val'
-        )
-        train_loader = DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.num_workers, collate_fn=cached_collate_fn,
-            pin_memory=True, persistent_workers=True, prefetch_factor=2,
-        )
-        val_loader = DataLoader(
-            val_dataset, batch_size=args.batch_size, shuffle=False,
-            num_workers=args.num_workers, collate_fn=cached_collate_fn,
-            persistent_workers=True,
-        )
+        cache_suffix = args.cache_dir.suffix.lower() if args.cache_dir.is_file() else ""
+        if cache_suffix in {".h5", ".hdf5"}:
+            train_dataset = BucketedH5TeacherDataset(
+                str(args.cache_dir), val_ratio=args.val_ratio, split_seed=args.seed, return_split='train'
+            )
+            val_dataset = BucketedH5TeacherDataset(
+                str(args.cache_dir), val_ratio=args.val_ratio, split_seed=args.seed, return_split='val'
+            )
+            train_batch_sampler = BucketedBatchSampler(
+                train_dataset.bucket_to_indices,
+                batch_size=args.batch_size,
+                shuffle=True,
+                drop_last=False,
+                seed=args.seed,
+            )
+            val_batch_sampler = BucketedBatchSampler(
+                val_dataset.bucket_to_indices,
+                batch_size=args.batch_size,
+                shuffle=False,
+                drop_last=False,
+                seed=args.seed,
+            )
+            train_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler, **cache_loader_kwargs)
+            val_loader = DataLoader(val_dataset, batch_sampler=val_batch_sampler, **cache_loader_kwargs)
+        else:
+            train_dataset = CachedTeacherDataset(
+                args.cache_dir, val_ratio=args.val_ratio, return_split='train'
+            )
+            val_dataset = CachedTeacherDataset(
+                args.cache_dir, val_ratio=args.val_ratio, return_split='val'
+            )
+            train_loader = DataLoader(
+                train_dataset, batch_size=args.batch_size, shuffle=True, **cache_loader_kwargs
+            )
+            val_loader = DataLoader(
+                val_dataset, batch_size=args.batch_size, shuffle=False, **cache_loader_kwargs
+            )
     else:
         if args.pairs_file is None:
             raise ValueError("必须提供 --pairs-file 或有效的 --cache-dir")
@@ -652,32 +919,32 @@ def main() -> None:
         train_dataset = MultiScaleDataset(args.pairs_file, val_ratio=args.val_ratio, return_split='train')
         val_dataset = MultiScaleDataset(args.pairs_file, val_ratio=args.val_ratio, return_split='val')
         train_loader = DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.num_workers, collate_fn=multi_scale_collate_fn,
-            pin_memory=True, persistent_workers=True, prefetch_factor=2,
+            train_dataset, batch_size=args.batch_size, shuffle=True, **image_loader_kwargs
         )
         val_loader = DataLoader(
-            val_dataset, batch_size=args.batch_size, shuffle=False,
-            num_workers=args.num_workers, collate_fn=multi_scale_collate_fn,
-            persistent_workers=True,
+            val_dataset, batch_size=args.batch_size, shuffle=False, **image_loader_kwargs
         )
 
     # 缓存模式下 teacher 仅用于探测 feature dim，不参与训练循环推理
-    teacher = RoMaV2(RoMaV2.Cfg(setting=args.teacher_setting)).to(device).eval()
+    # teacher = RoMaV2(RoMaV2.Cfg(setting=args.teacher_setting)).to(device).eval()
 
-    with torch.inference_mode():
-        dummy_img = torch.zeros(1, 3, 512, 512, device=device)
-        img_a_lr, _, _, _ = make_teacher_inputs(dummy_img, dummy_img, teacher)
-        feat_a_flat, _ = extract_teacher_features_ds(teacher, img_a_lr, img_a_lr, args.teacher_grid_size)
-        actual_teacher_dim = feat_a_flat.shape[-1]
-        print(f"Detected Teacher Feature Dimension: {actual_teacher_dim}")
+    # with torch.inference_mode():
+    #     dummy_img = torch.zeros(1, 3, 512, 512, device=device)
+    #     img_a_lr, _, _, _ = make_teacher_inputs(dummy_img, dummy_img, teacher)
+    #     feat_a_flat, _ = extract_teacher_features_ds(teacher, img_a_lr, img_a_lr, args.teacher_grid_size)
+    #     actual_teacher_dim = feat_a_flat.shape[-1]
+    #     print(f"Detected Teacher Feature Dimension: {actual_teacher_dim}")
 
     # 缓存模式下释放 teacher 显存（训练循环里不再需要它）
-    if use_cache:
-        teacher.cpu()
-        torch.cuda.empty_cache()
-        print("[Cache] Teacher moved to CPU to free GPU memory.")
-
+    # if use_cache:
+    #     teacher.cpu()
+    #     torch.cuda.empty_cache()
+    #     print("[Cache] Teacher moved to CPU to free GPU memory.")
+    actual_teacher_dim_list = {
+        'base': 80,
+        'precise': 100
+    }
+    actual_teacher_dim =actual_teacher_dim_list[args.teacher_setting]
     student = AgriTPSStitcher(
         matcher_config={
             'd_model': args.d_model,
@@ -685,14 +952,25 @@ def main() -> None:
             'grid_size': args.teacher_grid_size
         },
         tps_config={
-            'grid_size': 10,
+            'grid_size': 8,
             'feat_channels': args.d_model
         }
     ).to(device)
 
-    # 优化器
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    backbone_params = []
+    other_params = []
 
+    for name, param in student.named_parameters():
+        if "backbone" in name:
+            backbone_params.append(param)
+        else:
+            other_params.append(param)
+
+    # 骨干网络使用 1/10 的学习率进行微调，防止预训练权重崩塌
+    optimizer = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': args.lr * 0.1},
+        {'params': other_params, 'lr': args.lr}
+    ], weight_decay=args.weight_decay)
     total_optimizer_steps = (len(train_loader) * args.epochs) // args.accum_steps
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=total_optimizer_steps, eta_min=1e-6
@@ -738,20 +1016,21 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.epochs + 1):
         cfg = get_phase_config(epoch)
+        if use_cache and isinstance(getattr(train_loader, 'batch_sampler', None), BucketedBatchSampler):
+            train_loader.batch_sampler.set_epoch(epoch)
         print(f"\n🚀 Entering Phase: {cfg['phase']} (Epoch {epoch})")
 
         reset_count = 0
         for name, param in student.named_parameters():
             # 确定当前参数应该的状态
             if "backbone" in name:
-                target_req_grad = False
+                target_req_grad = cfg['train_backbone']
             elif "tps_estimator.aggregator" in name:
                 target_req_grad = cfg['train_aggregator']
             elif "matcher" in name:
                 target_req_grad = cfg['train_matcher']
             else:
                 target_req_grad = True
-
             # 状态翻转检测：如果由 False 变为 True
             if prev_grad_states.get(name, target_req_grad) is False and target_req_grad is True:
                 # 彻底清空该参数的历史动量
@@ -764,17 +1043,17 @@ def main() -> None:
 
         if reset_count > 0:
             print(f"🧹 Optimizer states reset for {reset_count} unfrozen parameter tensors!")
-
         student.train()
-        student.matcher.backbone.eval()
-
-        for i, batch in enumerate(train_loader):
+        if cfg['train_backbone']:
+            pass
+        else:
+            student.matcher.backbone.eval()
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}", dynamic_ncols=True)
+        for i, batch in pbar:
             if use_cache:
-                # CachedTeacherDataset：collate 已经 stack 好，直接移到 GPU
                 img_a = batch['img_a'].to(device, non_blocking=True)
                 img_b = batch['img_b'].to(device, non_blocking=True)
             else:
-                # MultiScaleDataset：列表形式，需要手动对齐尺寸后 stack
                 img_a_list = [x.to(device, non_blocking=True) for x in batch['img_a']]
                 img_b_list = [x.to(device, non_blocking=True) for x in batch['img_b']]
 
@@ -794,104 +1073,116 @@ def main() -> None:
                         img_a[b_idx] = a
                         img_b[b_idx] = b
 
-            # input sanity
-            if not torch.isfinite(img_a).all().item():
-                print(f"[NaN/Inf] input/img_a: {_finite_stats(img_a)}")
-                continue
-            if not torch.isfinite(img_b).all().item():
-                print(f"[NaN/Inf] input/img_b: {_finite_stats(img_b)}")
-                continue
-
             if use_cache:
-                # 直接从 batch 取，零推理开销
                 t_warp_AB = batch['t_warp_AB'].to(device, non_blocking=True)
                 t_conf_AB = batch['t_conf_AB'].to(device, non_blocking=True)
                 t_feat_a = batch['t_feat_a'].to(device, non_blocking=True)
                 t_feat_b = batch['t_feat_b'].to(device, non_blocking=True)
-                t_out = {'warp_AB': t_warp_AB, 'confidence_AB': t_conf_AB}
-            else:
-                with torch.inference_mode():
-                    img_a_lr, img_b_lr, img_a_hr, img_b_hr = make_teacher_inputs(img_a, img_b, teacher)
-                    t_out = teacher(img_a_lr, img_b_lr, img_a_hr, img_b_hr)
-                    t_feat_a, t_feat_b = extract_teacher_features_ds(
-                        teacher, img_a_lr, img_b_lr, args.teacher_grid_size
-                    )
+                t_out = {
+                    'warp_AB': t_warp_AB,
+                    'confidence_AB': t_conf_AB,
+                    'confidence_is_prob': True,
+                }
+            # else:
+            #     with torch.inference_mode():
+            #         img_a_lr, img_b_lr, img_a_hr, img_b_hr = make_teacher_inputs(img_a, img_b, teacher)
+            #         t_out = teacher(img_a_lr, img_b_lr, img_a_hr, img_b_hr)
+            #         t_feat_a, t_feat_b = extract_teacher_features_ds(
+            #             teacher, img_a_lr, img_b_lr, args.teacher_grid_size
+            #         )
+            #         t_out['confidence_is_prob'] = False
 
-            # loss 计算
             def _forward_losses(amp_enabled: bool):
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     stu_out = student(img_a, img_b)
                     stu_output = stu_out["matcher_out"]
 
-                    final_grid = stu_out["dense_grid"]  # [B, H_img, W_img, 2]
+                    final_grid = stu_out["dense_grid"]
                     conf_refine = stu_output['confidence_AB']
 
                     B_img, H_img, W_img, _ = final_grid.shape
                     grid_full = make_grid(B_img, H_img, W_img, final_grid.device, final_grid.dtype)
                     current_flow_final = final_grid - grid_full
 
-                    # 将置信度上采样到全分辨率以对齐 geo_loss
                     if conf_refine.shape[-2:] != (H_img, W_img):
                         conf_for_geo = F.interpolate(
-                            conf_refine.unsqueeze(1),
-                            size=(H_img, W_img),
-                            mode='bilinear',
-                            align_corners=False
+                            conf_refine.unsqueeze(1), size=(H_img, W_img),
+                            mode='bilinear', align_corners=False
                         ).squeeze(1)
                     else:
                         conf_for_geo = conf_refine
 
                     geo_loss = geo_loss_fn(current_flow_final, conf_for_geo)
-
                     d_loss = distill_loss_fn(
                         stu_output=stu_output,
                         teacher_warp=t_out["warp_AB"],
-                        teacher_conf=teacher_overlap_map(t_out["confidence_AB"]),
+                        teacher_conf=(
+                            t_out["confidence_AB"]
+                            if t_out.get("confidence_is_prob", False)
+                            else teacher_overlap_map(t_out["confidence_AB"])
+                        ),
                         teacher_feat_A=t_feat_a,
                         teacher_feat_B=t_feat_b,
                     )
-
                     f_loss = stu_out["tps_out"].get("fold_loss", torch.tensor(0.0, device=device))
-                    p_loss = compute_photometric_loss(
-                        img_a, img_b, stu_out["dense_grid"], stu_out["matcher_out"]["confidence_AB"]
-                    )
 
                     if "SELF_SUPERVISED" in cfg["phase"]:
-                        # 不对称特征扰动，给逆向过程 (B->A) 的图像注入高斯噪声或微小亮度偏移。强迫网络依靠高维语义和几何结构去匹配，而不是死记硬背像素值。
                         noise_std = 0.02
                         noise_b = torch.randn_like(img_b) * noise_std
                         noise_a = torch.randn_like(img_a) * noise_std
-
-                        # 注入噪声并裁剪回合理区间
-                        b_min, b_max = img_b.min(), img_b.max()
-                        a_min, a_max = img_a.min(), img_a.max()
-
-                        img_b_noisy = (img_b + noise_b).clamp(b_min, b_max)
-                        img_a_noisy = (img_a + noise_a).clamp(a_min, a_max)
-
-                        # 使用带噪声的图像进行逆向推理
+                        img_b_noisy = (img_b + noise_b).clamp(img_b.min(), img_b.max())
+                        img_a_noisy = (img_a + noise_a).clamp(img_a.min(), img_a.max())
                         stu_out_ba = student(img_b_noisy, img_a_noisy)
-
                         c_loss = compute_cycle_consistency_loss(stu_out, stu_out_ba)
                     else:
                         c_loss = torch.tensor(0.0, device=device)
 
-                    # h_loss = torch.norm(stu_out.get('H_mat', torch.eye(3).to(device)) - torch.eye(3).to(device))
-
-                    w = cfg["weights"]
-                    total_loss = (
-                            w["distill"] * d_loss["total"]
-                            + w["fold"] * f_loss
-                            + w["photo"] * p_loss
-                            + w["cycle"] * c_loss
-                            + w["geo"] * geo_loss
-                        # + w.get("homo", 0.1) * h_loss
+                # ── Photo loss 移到 autocast 块外，强制在 FP32 下计算 ──────────────
+                # 即使 amp_enabled=False，放在外面也没有副作用
+                use_ssim_now = (epoch > 10)
+                with torch.amp.autocast("cuda", enabled=False):  # 显式禁用 autocast
+                    p_loss = compute_photometric_loss(
+                        img_a.float(),
+                        img_b.float(),
+                        stu_out["dense_grid"].float(),
+                        stu_out["matcher_out"]["confidence_AB"].float(),
+                        use_ssim=use_ssim_now,
+                        alpha=0.85,
                     )
+
+                w = cfg["weights"]
+                total_loss = (
+                        w["distill"] * d_loss["total"]
+                        + w["fold"] * f_loss
+                        + w["photo"] * p_loss
+                        + w["cycle"] * c_loss
+                        + w["geo"] * geo_loss
+                )
                 return stu_out, d_loss, f_loss, p_loss, c_loss, geo_loss, total_loss
 
             stu_out, d_loss, f_loss, p_loss, c_loss, geo_loss, total_loss = _forward_losses(use_amp)
 
-            # 反向传播
+            loss_dict = {
+                "distill": d_loss["total"],
+                "fold": f_loss if torch.is_tensor(f_loss) else torch.tensor(f_loss, device=device),
+                "photo": p_loss,
+                "cycle": c_loss if torch.is_tensor(c_loss) else torch.tensor(c_loss, device=device),
+                "geo": geo_loss,
+                "total": total_loss
+            }
+
+            ok = True
+            for k, v in loss_dict.items():
+                if not torch.isfinite(v).all().item():
+                    pbar.write(f"🚨 [NaN/Inf] Loss '{k}' is invalid! Value: {v.item() if v.numel() == 1 else 'Tensor'}")
+                    ok = False
+
+            if not ok:
+                pbar.write(f"⏭️ Skipping batch at step {global_step} due to NaN loss.")
+                optimizer.zero_grad(set_to_none=True)
+                if device.type == "cuda": torch.cuda.empty_cache()
+                continue
+
             loss_for_backward = total_loss / args.accum_steps
             total_loss_scalar = float(total_loss.detach().item())
             distill_scalar = float(d_loss['total'].detach().item())
@@ -899,88 +1190,75 @@ def main() -> None:
             photo_scalar = float(p_loss.detach().item())
             cycle_scalar = float(c_loss.detach().item()) if torch.is_tensor(c_loss) else float(c_loss)
 
-            # NaN/Inf guard: locate which term first becomes non-finite
-            ok = True
-            ok &= _check_finite("loss/distill_total", d_loss["total"])
-            ok &= _check_finite("loss/fold", f_loss if torch.is_tensor(f_loss) else torch.tensor(f_loss, device=device))
-            ok &= _check_finite("loss/photo", p_loss)
-            ok &= _check_finite("loss/cycle",
-                                c_loss if torch.is_tensor(c_loss) else torch.tensor(c_loss, device=device))
-            ok &= _check_finite("loss/total", total_loss)
-            if isinstance(stu_out, dict):
-                if "dense_grid" in stu_out and torch.is_tensor(stu_out["dense_grid"]):
-                    ok &= _check_finite("stu/dense_grid", stu_out["dense_grid"])
-                mo = stu_out.get("matcher_out")
-                if isinstance(mo, dict) and "confidence_AB" in mo and torch.is_tensor(mo["confidence_AB"]):
-                    ok &= _check_finite("stu/confidence_AB", mo["confidence_AB"])
-                to = stu_out.get("tps_out")
-                if isinstance(to, dict) and "delta_cp" in to and torch.is_tensor(to["delta_cp"]):
-                    ok &= _check_finite("stu/delta_cp", to["delta_cp"])
-
-            if not ok:
-                if use_amp:
-                    print("[NaN/Inf] Detected under AMP. Retrying in fp32...")
-                    stu_out, d_loss, f_loss, p_loss, c_loss, geo_loss, total_loss = \
-                        _forward_losses(False)
-                    ok2 = _check_finite("fp32/loss/total", total_loss)
-                    if ok2:
-                        print("[AMP] Disabling AMP, continuing in fp32.")
-                        use_amp = False
-                        scaler = torch.amp.GradScaler("cuda", enabled=False)
-                        loss_for_backward = total_loss / args.accum_steps  # <-- 关键：重新赋值
-                    else:
-                        optimizer.zero_grad(set_to_none=True)
-                        if device.type == "cuda": torch.cuda.empty_cache()
-                        continue
-                else:
-                    optimizer.zero_grad(set_to_none=True)
-                    if device.type == "cuda": torch.cuda.empty_cache()
-                    continue
-
+            # 反向传播
             scaler.scale(loss_for_backward).backward()
 
-            if (i + 1) % args.accum_steps == 0:
+            if (i + 1) % args.accum_steps == 0 or (i + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(student.parameters(), args.grad_clip)
-                scaler.step(optimizer)
+
+                has_nan_grad = False
+                for p in student.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all().item():
+                        has_nan_grad = True
+                        break
+
+                if has_nan_grad:
+                    pbar.write(f"🛡️ [Gradient Shield] NaN/Inf gradient at step {global_step}! Skipping optimizer step.")
+                else:
+                    scaler.step(optimizer)
+
+                # scheduler 无论是否 NaN 都步进，保持 LR 衰减与 epoch 进度同步
+                scheduler.step()
+
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
                 global_step += 1
 
-                # 记录 Log
+                loss_metrics = {
+                    'total': total_loss_scalar,
+                    'distill': distill_scalar,
+                    'fold': fold_scalar,
+                    'photo': photo_scalar,
+                    'cycle': cycle_scalar,
+                    'geo': geo_loss.item()
+                }
+                smoothed = loss_tracker.update(loss_metrics)
+                pbar.set_postfix({
+                    'Loss': f"{smoothed['total_ema']:.4f}",
+                    'Photo': f"{smoothed['photo_ema']:.4f}",
+                    'Fold': f"{smoothed['fold_ema']:.4f}",
+                    'Geo': f"{smoothed['geo_ema']:.4f}"
+                })
+
                 if global_step % args.log_interval == 0:
-                    loss_metrics = {
-                        'total': total_loss_scalar,
-                        'distill': distill_scalar,
-                        'fold': fold_scalar,
-                        'photo': photo_scalar,
-                        'cycle': cycle_scalar,
-                        'geo': geo_loss.item()
-                    }
-                    smoothed = loss_tracker.update(loss_metrics)
-                    print(
-                        f"""Epoch {epoch} | Step {global_step} | Loss: {smoothed['total_ema']:.4f} | Photo: {smoothed['photo_ema']:.4f} | Fold: {smoothed['fold_ema']:.4f} | Geo: {smoothed['geo_ema']}""")
                     for k, v in smoothed.items():
                         writer.add_scalar(f"Train/{k}", v, global_step)
 
                     with torch.no_grad():
                         visualize_results(img_a, img_b, stu_out, global_step, writer)
 
-                # Validate
                 if global_step % args.val_interval == 0:
                     val_losses = validate(
                         student=student,
-                        teacher=teacher,
                         val_loader=val_loader,
-                        loss_fn=distill_loss_fn,
+                        distill_loss_fn=distill_loss_fn,
+                        geo_loss_fn=geo_loss_fn,
+                        cfg=cfg,
                         device=device,
-                        teacher_grid_size=args.teacher_grid_size,
+                        use_amp=use_amp,
+                        epoch=epoch
                     )
                     val_total = val_losses['total']
 
-                    print(f"📊 [val] step={global_step} | total={val_total:.4f}")
+                    pbar.write(f"📊 [val] step={global_step} | total={val_total:.4f}")
                     writer.add_scalar("Val/Total", val_total, global_step)
+                    writer.add_scalar("Val/Distill", val_losses['distill'], global_step)
+                    writer.add_scalar("Val/Photo", val_losses['photo'], global_step)
+                    writer.add_scalar("Val/Fold", val_losses['fold'], global_step)
+                    writer.add_scalar("Val/Cycle", val_losses['cycle'], global_step)
+                    writer.add_scalar("Val/Geo", val_losses['geo'], global_step)
+                    writer.add_scalar("Val/FoldRatio", val_losses['fold_ratio'], global_step)
 
                     is_best = val_total < best_val_loss
                     if is_best:
@@ -996,10 +1274,9 @@ def main() -> None:
                         is_best=is_best,
                     )
 
-        print(f"[epoch {epoch}] Done. EMA={loss_tracker.get_ema('total'):.4f}")
+        pbar.write(f"[epoch {epoch}] Done. EMA={loss_tracker.get_ema('total'):.4f}")
 
     writer.close()
-
 
 if __name__ == "__main__":
     main()

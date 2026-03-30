@@ -1,12 +1,18 @@
+import os
 from pathlib import Path
 import random
-from typing import List, Tuple, Dict
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import cv2
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+
+try:
+    import h5py  # type: ignore[import-not-found]
+except ImportError:
+    h5py = None
 
 # 多尺度数据集
 class MultiScaleDataset(Dataset):
@@ -192,7 +198,7 @@ class CachedTeacherDataset(Dataset):
         return len(self.cache_files)
 
     def __getitem__(self, idx):
-        cache_data = torch.load(self.cache_files[idx])
+        cache_data = torch.load(self.cache_files[idx], weights_only=False)
 
         # 执行线上 Transform (自动区分 Train/Val)
         aug_out = self.online_transform(
@@ -208,3 +214,147 @@ class CachedTeacherDataset(Dataset):
             "t_feat_a": cache_data['feat_A'].float(),
             "t_feat_b": cache_data['feat_B'].float(),
         }
+
+
+class BucketedH5TeacherDataset(Dataset):
+    def __init__(
+            self,
+            h5_path: str,
+            val_ratio: float = 0.1,
+            split_seed: int = 42,
+            return_split: str = 'train'
+    ):
+        if h5py is None:
+            raise ImportError("h5py is required to read bucketed HDF5 teacher cache.")
+
+        self.h5_path = Path(h5_path)
+        self.return_split = return_split
+        self.is_train = (return_split == 'train')
+        self._h5_file: Optional["h5py.File"] = None
+
+        with h5py.File(self.h5_path, 'r') as h5f:
+            bucket_to_samples: Dict[str, List[Tuple[str, str]]] = {}
+            for bucket_name in sorted(h5f.keys()):
+                sample_keys = sorted(h5f[bucket_name].keys())
+                bucket_to_samples[bucket_name] = [(bucket_name, sample_key) for sample_key in sample_keys]
+
+        rng = random.Random(split_seed)
+        self.items: List[Tuple[str, str]] = []
+        self.bucket_to_indices: Dict[str, List[int]] = {}
+
+        for bucket_name, bucket_items in bucket_to_samples.items():
+            rng.shuffle(bucket_items)
+            val_size = max(1, int(len(bucket_items) * val_ratio))
+            selected_items = bucket_items[val_size:] if self.is_train else bucket_items[:val_size]
+
+            start_idx = len(self.items)
+            self.items.extend(selected_items)
+            self.bucket_to_indices[bucket_name] = list(range(start_idx, start_idx + len(selected_items)))
+
+        if self.is_train:
+            self.online_transform = A.Compose([
+                A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.03, p=0.5),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2()
+            ], additional_targets={'image_b': 'image'})
+        else:
+            self.online_transform = A.Compose([
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2()
+            ], additional_targets={'image_b': 'image'})
+
+        print(f"[{return_split.upper()} Set] Loaded {len(self.items)} bucketed HDF5 cached items from {self.h5_path}.")
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_h5_file"] = None
+        return state
+
+    def _get_h5_file(self):
+        current_pid = os.getpid()
+        if self._h5_file is None or getattr(self, '_h5_pid', None) != current_pid:
+            if self._h5_file is not None:
+                try:
+                    self._h5_file.close()
+                except Exception:
+                    pass
+            self._h5_file = h5py.File(self.h5_path, 'r')
+            self._h5_pid = current_pid
+        return self._h5_file
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        bucket_name, sample_key = self.items[idx]
+        sample_group = self._get_h5_file()[bucket_name][sample_key]
+
+        img_a = sample_group['img_a'][()]
+        img_b = sample_group['img_b'][()]
+        aug_out = self.online_transform(image=img_a, image_b=img_b)
+
+        return {
+            "img_a": aug_out['image'],
+            "img_b": aug_out['image_b'],
+            "t_warp_AB": torch.from_numpy(sample_group['warp_AB'][()]).float(),
+            "t_conf_AB": torch.from_numpy(sample_group['confidence_AB'][()]).float(),
+            "t_feat_a": torch.from_numpy(sample_group['feat_A'][()]).float(),
+            "t_feat_b": torch.from_numpy(sample_group['feat_B'][()]).float(),
+            "bucket_name": bucket_name,
+        }
+
+    def __del__(self):
+        if self._h5_file is not None:
+            try:
+                self._h5_file.close()
+            except Exception:
+                pass
+
+
+class BucketedBatchSampler(Sampler[List[int]]):
+    def __init__(
+            self,
+            bucket_to_indices: Dict[str, List[int]],
+            batch_size: int,
+            shuffle: bool = True,
+            drop_last: bool = False,
+            seed: int = 42,
+    ):
+        self.bucket_to_indices = {k: list(v) for k, v in bucket_to_indices.items() if v}
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self) -> Iterator[List[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        batches: List[List[int]] = []
+
+        for indices in self.bucket_to_indices.values():
+            bucket_indices = list(indices)
+            if self.shuffle:
+                rng.shuffle(bucket_indices)
+
+            for start in range(0, len(bucket_indices), self.batch_size):
+                batch = bucket_indices[start:start + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                batches.append(batch)
+
+        if self.shuffle:
+            rng.shuffle(batches)
+
+        yield from batches
+
+    def __len__(self) -> int:
+        total = 0
+        for indices in self.bucket_to_indices.values():
+            if self.drop_last:
+                total += len(indices) // self.batch_size
+            else:
+                total += (len(indices) + self.batch_size - 1) // self.batch_size
+        return total
