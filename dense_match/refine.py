@@ -282,7 +282,7 @@ class WarpRefiner(nn.Module):
         return refined_warp, overlap_logits, overlap
 
 
-def ssim_map(img1, img2, mask, window_size=7, sigma=1.5):
+def ssim_map(img1, img2, window_size=7, sigma=1.5):
     _, C, H, W = img1.shape
     device = img1.device
 
@@ -290,28 +290,22 @@ def ssim_map(img1, img2, mask, window_size=7, sigma=1.5):
         gauss = torch.exp(-(torch.arange(window_size).float() - window_size // 2) ** 2 / (2 * sigma ** 2))
         return gauss / gauss.sum()
 
-    _1D_window = gaussian(window_size, sigma).unsqueeze(1).to(device=device, dtype=torch.float32)  # 显式 fp32
+    _1D_window = gaussian(window_size, sigma).unsqueeze(1).to(device=device, dtype=torch.float32)
     window = _1D_window.mm(_1D_window.t()).unsqueeze(0).unsqueeze(0)
     window = window.expand(C, 1, window_size, window_size).contiguous()
 
-    # 预计算 Mask 的卷积权重（用于归一化均值）
-    # mask 形状假设为 [B, 1, H, W]
-    mask_weight = F.conv2d(mask.expand(-1, C, -1, -1), window, padding=window_size // 2, groups=C)
-    mask_weight = mask_weight.clamp(min=1e-6)  # 避免除零
-
-    # 计算归一化均值 mu = E[x] = conv(img * mask) / conv(mask)
-    mu1 = F.conv2d(img1 * mask, window, padding=window_size // 2, groups=C) / mask_weight
-    mu2 = F.conv2d(img2 * mask, window, padding=window_size // 2, groups=C) / mask_weight
+    # 均值 E[x]
+    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=C)
+    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=C)
 
     mu1_sq = mu1.pow(2)
     mu2_sq = mu2.pow(2)
     mu1_mu2 = mu1 * mu2
 
-    # 计算归一化方差 sigma^2 = E[x^2] - (E[x])^2
-    # E[x^2] = conv(img^2 * mask) / conv(mask)
-    sigma1_sq = F.conv2d((img1 * img1) * mask, window, padding=window_size // 2, groups=C) / mask_weight - mu1_sq
-    sigma2_sq = F.conv2d((img2 * img2) * mask, window, padding=window_size // 2, groups=C) / mask_weight - mu2_sq
-    sigma12 = F.conv2d((img1 * img2) * mask, window, padding=window_size // 2, groups=C) / mask_weight - mu1_mu2
+    # 方差 E[x^2] - (E[x])^2
+    sigma1_sq = (F.conv2d(img1 * img1, window, padding=window_size // 2, groups=C) - mu1_sq).clamp(min=0.0)
+    sigma2_sq = (F.conv2d(img2 * img2, window, padding=window_size // 2, groups=C) - mu2_sq).clamp(min=0.0)
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=C) - mu1_mu2
 
     C1, C2 = 0.01 ** 2, 0.03 ** 2
 
@@ -322,26 +316,30 @@ def ssim_map(img1, img2, mask, window_size=7, sigma=1.5):
     return ssim_n / (ssim_d + 1e-8)
 
 def compute_cycle_loss(warp_AB, warp_BA, conf_A):
-    """
-    warp_AB: (B, H, W, 2) - A到B的坐标
-    warp_BA: (B, H, W, 2) - B到A的坐标
-    conf_A:  (B, H, W)    - A点的置信度
-    """
     B, H, W, _ = warp_AB.shape
-    # 生成 A 的原始坐标网格
-    grid_A = make_grid(B, H, W, warp_AB.device, warp_AB.dtype) 
-    
-    # 将 warp_BA 重采样，得到“如果在B点，它认为对应的A点在哪里”
-    # 然后根据 warp_AB 的指向，取回对应的坐标
-    identity_A_pred = safe_grid_sample(warp_BA.permute(0,3,1,2), warp_AB).permute(0,2,3,1)
-    
-    # 计算循环误差
+
+    # 有效性 mask：warp_AB 指向 B 图范围内的点
+    valid = (warp_AB[..., 0].abs() < 0.999) & \
+            (warp_AB[..., 1].abs() < 0.999)
+
+    identity_A_pred = safe_grid_sample(
+        warp_BA.permute(0,3,1,2),
+        warp_AB,
+        padding_mode='border',
+    ).permute(0,2,3,1)
+
+    grid_A = make_grid(B, H, W, warp_AB.device, warp_AB.dtype)
     cycle_dist = torch.norm(identity_A_pred - grid_A, dim=-1)
-    return (cycle_dist * conf_A).mean()
+
+    final_mask = valid.float() * (conf_A > 0.1).float()
+    valid_count = final_mask.sum().clamp(min=1.0)
+    return (cycle_dist * conf_A * final_mask).sum() / valid_count
 
 
 def compute_photometric_loss(img_a, img_b, dense_grid, confidence,
-                              use_ssim: bool = False, alpha: float = 0.85):
+                              use_ssim: bool = False, alpha: float = 0.85,
+                              img_mean=(0.485, 0.456, 0.406),
+                              img_std=(0.229, 0.224, 0.225)):
     assert img_a.dtype == torch.float32, f"img_a dtype={img_a.dtype}, expected float32"
     assert img_b.dtype == torch.float32, f"img_b dtype={img_b.dtype}, expected float32"
     B, C, H, W = img_a.shape
@@ -351,8 +349,8 @@ def compute_photometric_loss(img_a, img_b, dense_grid, confidence,
     img_b_f = img_b.float()
     dense_grid_f = dense_grid.float()
 
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=torch.float32).view(1, 3, 1, 1)
-    std  = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    mean = torch.tensor(list(img_mean), device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    std  = torch.tensor(list(img_std),  device=device, dtype=torch.float32).view(1, 3, 1, 1)
 
     img_a_raw = (img_a_f * std + mean).clamp(0, 1)
     img_b_raw = (img_b_f * std + mean).clamp(0, 1)
@@ -367,15 +365,16 @@ def compute_photometric_loss(img_a, img_b, dense_grid, confidence,
         img_curr = img_a_raw
 
     ones = torch.ones((B, 1, *target_hw), device=device, dtype=torch.float32)
-    mask = F.grid_sample(ones, dense_grid_f, mode='nearest',
-                          padding_mode='zeros', align_corners=False)
-    mask = (mask > 0.9).float().detach()
+    soft_mask = F.grid_sample(ones, dense_grid_f, mode='bilinear',
+                              padding_mode='zeros', align_corners=False)
+    mask = (soft_mask > 0.9).float().detach()
 
     l1_map = torch.abs(img_curr - warped_b).mean(dim=1, keepdim=True)
 
     if use_ssim:
-        s_map = ssim_map(img_curr, warped_b, mask)
-        ssim_loss_map = 1.0 - s_map.mean(dim=1, keepdim=True)
+        s_map = ssim_map(img_curr, warped_b)
+        s_map_masked = s_map * mask.expand_as(s_map)
+        ssim_loss_map = (1.0 - s_map_masked.mean(dim=1, keepdim=True))
         photo_loss_map = alpha * ssim_loss_map + (1.0 - alpha) * l1_map
     else:
         photo_loss_map = l1_map
@@ -393,56 +392,49 @@ def compute_photometric_loss(img_a, img_b, dense_grid, confidence,
 
 
 def compute_cycle_consistency_loss(stu_out_ab, stu_out_ba):
-    """
-    高鲁棒性 A->B->A 坐标回环误差计算 (防坍塌设计)
-    """
-    # 切断前向梯度的传播 (Stop-Gradient)，将 A->B 的场作为绝对的 "伪标签"，只允许梯度更新 B->A 的网络参数。
-    # 这打破了前向和后向网络共同退化为恒等映射(Identity)的捷径。
-    grid_ab = stu_out_ab['dense_grid'].detach()  # [B, H, W, 2] -> 必须 detach
-    conf_a = stu_out_ab['matcher_out']['confidence_AB'].detach()  # [B, h_m, w_m] -> 必须 detach
+    # grid_ab 是 Detach 的物理基准，代表 A -> B
+    grid_ab = stu_out_ab['matcher_out']['warp_AB'].detach()  # [B, Hf, Wf, 2]
+    conf_a = stu_out_ab['matcher_out']['confidence_AB'].detach()  # [B, Hf, Wf]
 
-    grid_ba = stu_out_ba['dense_grid']  # [B, H, W, 2] -> 保留梯度
+    # grid_ba 是需要被优化训练的参数，代表 B -> A
+    grid_ba = stu_out_ba['matcher_out']['warp_AB']  # [B, Hf, Wf, 2]
 
     B, H, W, _ = grid_ab.shape
     device = grid_ab.device
 
-    # 构建 Identity 网格 (全分辨率)
-    # y 轴和 x 轴生成时必须与 make_grid 的 align_corners=False 规范严格对齐
+    # 因为 grid_ab 被 detach 了，所以这不会截断梯度，只作为客观物理条件的 Mask
+    valid_in_B = (grid_ab[..., 0].abs() <= 1.0) & \
+                 (grid_ab[..., 1].abs() <= 1.0)  # [B, H, W], bool
+
+    # 使用 padding_mode='border' 防止边界采样产生指向图片中心的错误梯度
+    back_to_a = F.grid_sample(
+        grid_ba.permute(0, 3, 1, 2),  # [B, 2, Hf, Wf]
+        grid_ab,
+        mode='bilinear',
+        padding_mode='border',  # 核心防线！
+        align_corners=False,
+    ).permute(0, 2, 3, 1)  # [B, Hf, Wf, 2]
+
+
+    # 构建理论完美的 identity 坐标
     ys = (torch.arange(H, device=device, dtype=grid_ab.dtype) + 0.5) * (2.0 / H) - 1.0
     xs = (torch.arange(W, device=device, dtype=grid_ab.dtype) + 0.5) * (2.0 / W) - 1.0
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
     identity = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
 
-    # 采样回环坐标
-    # 拿着 A->B 的坐标，去 B->A 的形变场里查表，看看它指回 A 的哪里
-    back_to_a = F.grid_sample(
-        grid_ba.permute(0, 3, 1, 2),
-        grid_ab,
-        mode='bilinear',
-        padding_mode='border',  # 使用 border 比 zeros 更安全，防止边缘点回环出界导致大幅误判
-        align_corners=False
-    ).permute(0, 2, 3, 1)  # [B, H, W, 2]
+    diff = back_to_a.float() - identity.float()
+    cycle_error = (diff ** 2).sum(dim=-1).clamp(min=1e-8).sqrt()  # [B, H, W]
 
-    # 计算欧氏距离误差 [B, H, W]
-    cycle_error = torch.norm(back_to_a - identity, dim=-1)
+    conf_mask = (conf_a > 0.1)  # [B, H, W], bool
+    final_mask = (valid_in_B & conf_mask).float()
 
-    # 置信度尺寸对齐
-    if conf_a.shape[-2:] != (H, W):
-        conf_a = F.interpolate(
-            conf_a.unsqueeze(1),
-            size=(H, W),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(1)
+    # 防止所有点都失效导致的除以零 NaN
+    valid_count = final_mask.sum().clamp(min=1.0)
 
-    # 动态掩码阈值截断，极低置信度的区域往往是视野外(Out-of-FOV)或严重遮挡，强行计算回环会让网络混乱。
-    # 丢弃掉 conf < 0.1 的死区，只在有效区域计算 loss
-    valid_mask = (conf_a > 0.1).float()
+    # 计算最终带有权重的平均误差
+    weighted_error = cycle_error * conf_a * final_mask
 
-    # 加权求平均：依靠 detach 后的 confidence 作为权重，防止网络通过降低置信度来逃避 Loss
-    weighted_error = cycle_error * conf_a * valid_mask
-
-    return weighted_error.sum() / (valid_mask.sum() + 1e-6)
+    return weighted_error.sum() / valid_count
 
 if __name__ == "__main__":
     pass

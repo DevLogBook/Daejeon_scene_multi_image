@@ -12,7 +12,7 @@ img_list = sorted([f for f in os.listdir(base_folder) if not f.startswith('.')])
 
 count = 0
 
-with open("pair.txt", "a", encoding='utf-8') as f:
+with open("pairs_2.txt", "w", encoding='utf-8') as f:
     for i, img_name in enumerate(img_list):
         if img_name.startswith('.') or img_list[i+1].startswith('.'):
             continue

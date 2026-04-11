@@ -1,7 +1,11 @@
 import argparse
-from pathlib import Path
 import sys
-from typing import TYPE_CHECKING
+import time
+from pathlib import Path
+import torch
+import torch.nn.functional as F
+import cv2
+import numpy as np
 import platform
 import pathlib
 
@@ -9,245 +13,199 @@ import pathlib
 if platform.system() == 'Windows':
     pathlib.PosixPath = pathlib.WindowsPath
 
-import cv2
-import numpy as np
-import torch
-import torch.nn.functional as F
-from PIL import Image
-import torchvision.transforms.functional as TF
-import matplotlib.pyplot as plt
-from dense_match.network import AgriMatcher
-# REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent
 
+project_root = REPO_ROOT.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+from dense_match.network import AgriTPSStitcher
 
-# if TYPE_CHECKING:  # pragma: no cover
-   
-
-# 辅助函数：图像加载与预处理
-def load_rgb_tensor(path: Path, size: int) -> torch.Tensor:
-    img = Image.open(path).convert("RGB")
-    
-    # 显式计算等比例缩放后的尺寸，强制最长边等于 size
-    w, h = img.size
-    if w >= h:
-        new_w = size
-        new_h = int(h * (size / w))
-    else:
-        new_h = size
-        new_w = int(w * (size / h))
-        
-    # 传入 [new_h, new_w] 明确指定高和宽，彻底绕过 max_size 冲突
-    img = TF.resize(img, [new_h, new_w], antialias=True)
-    ten = TF.to_tensor(img)  # [C, H, W]
-    
-    # 补黑边 (Padding) 至严格的 size x size 正方形
-    _, curr_h, curr_w = ten.shape
-    pad_bottom = size - curr_h
-    pad_right = size - curr_w
-    
-    # F.pad 的参数顺序是 (左, 右, 上, 下)
-    ten = F.pad(ten, (0, pad_right, 0, pad_bottom), value=0.0)
-    
-    return ten
-
-def visualize_stitching_result(img_A, img_B, warp_AB, confidence_AB=None, save_path='stitch_res.jpg', conf_thresh=0.5):
+def torch_grid_to_cv2_map(grid_tensor: torch.Tensor, out_h: int, out_w: int) -> tuple:
     """
-    计算单应性矩阵，构建全景画布，并将两张图像拼接融合。
+    将 PyTorch [-1, 1] (align_corners=False) 的 normalized grid 转换为 OpenCV 的绝对像素坐标
     """
-    # 1. 张量转换为 NumPy 数组 (H, W, C)
-    img_A_np = img_A[0].permute(1, 2, 0).cpu().detach().numpy()
-    img_B_np = img_B[0].permute(1, 2, 0).cpu().detach().numpy()
-    warp_np = warp_AB[0].cpu().detach().numpy()
-    
-    H_img, W_img, _ = img_A_np.shape
-    gs = warp_AB.shape[1]
+    grid = grid_tensor.squeeze(0).cpu().numpy()  # [H, W, 2]
 
-    if confidence_AB is not None:
-        conf_np = confidence_AB[0].cpu().detach().numpy()
-    else:
-        conf_np = np.ones((gs, gs))
+    if grid.shape[0] != out_h or grid.shape[1] != out_w:
+        grid = cv2.resize(grid, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
-    # 2. 提取高置信度匹配点
-    y_idx = np.linspace(-1, 1, gs)
-    x_idx = np.linspace(-1, 1, gs)
-    grid_x, grid_y = np.meshgrid(x_idx, y_idx)
+    # 严格遵循 align_corners=False 的数学逆映射
+    map_x = ((grid[..., 0] + 1.0) / 2.0) * out_w - 0.5
+    map_y = ((grid[..., 1] + 1.0) / 2.0) * out_h - 0.5
 
-    mask = conf_np > conf_thresh
-    pts_A_norm = np.stack([grid_x[mask], grid_y[mask]], axis=-1)
-    pts_B_norm = warp_np[mask]
+    return map_x.astype(np.float32), map_y.astype(np.float32)
 
-    if len(pts_A_norm) < 4:
-        print("有效匹配点不足，无法执行拼接。")
-        return
 
-    # 3. 坐标映射至像素空间
-    pts_A_px = (pts_A_norm + 1.0) / 2.0 * np.array([W_img - 1, H_img - 1])
-    pts_B_px = (pts_B_norm + 1.0) / 2.0 * np.array([W_img - 1, H_img - 1])
-    
-    pts_A_px = pts_A_px.astype(np.float32)
-    pts_B_px = pts_B_px.astype(np.float32)
+def generate_voronoi_seam_masks(mask_a: np.ndarray, mask_b: np.ndarray):
+    """利用距离变换生成最佳接缝 (Voronoi Seam)"""
+    dist_a = cv2.distanceTransform(mask_a, cv2.DIST_L2, 5)
+    dist_b = cv2.distanceTransform(mask_b, cv2.DIST_L2, 5)
 
-    # 4. 计算单应性矩阵 (由 B 映射至 A)
-    H_matrix, inliers = cv2.findHomography(pts_B_px, pts_A_px, cv2.USAC_MAGSAC, 3.0)
+    blend_mask_a = (dist_a > dist_b).astype(np.uint8) * 255
+    blend_mask_b = (dist_b >= dist_a).astype(np.uint8) * 255
 
-    if H_matrix is None:
-        print("单应性矩阵计算失败。")
-        return
+    blend_mask_a = cv2.bitwise_and(blend_mask_a, mask_a)
+    blend_mask_b = cv2.bitwise_and(blend_mask_b, mask_b)
 
-    # 5. 计算拼接后的大画布尺寸
-    # 获取图像 B 的四个角点
-    corners_B = np.float32([[0, 0], [0, H_img], [W_img, H_img], [W_img, 0]]).reshape(-1, 1, 2)
-    # 将图像 B 的角点投影到图像 A 的坐标系中
-    warped_corners_B = cv2.perspectiveTransform(corners_B, H_matrix)
-    
-    # 获取图像 A 的角点
-    corners_A = np.float32([[0, 0], [0, H_img], [W_img, H_img], [W_img, 0]]).reshape(-1, 1, 2)
-    
-    # 合并所有角点以找到全局边界
-    all_corners = np.concatenate((corners_A, warped_corners_B), axis=0)
-    
-    [x_min, y_min] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
-    [x_max, y_max] = np.int32(all_corners.max(axis=0).ravel() + 0.5)
-    
-    # 6. 计算平移矩阵，避免图像投影后出现负坐标导致被裁剪
-    translation_x = -x_min
-    translation_y = -y_min
-    T_matrix = np.array([
-        [1, 0, translation_x],
-        [0, 1, translation_y],
-        [0, 0, 1]
-    ], dtype=np.float32)
-    
-    canvas_w = x_max - x_min
-    canvas_h = y_max - y_min
+    return blend_mask_a, blend_mask_b
 
-    # 7. 图像投影与融合
-    # 投影图像 B
-    canvas_B = cv2.warpPerspective(img_B_np, T_matrix @ H_matrix, (canvas_w, canvas_h))
-    # 投影图像 A (仅进行平移)
-    canvas_A = cv2.warpPerspective(img_A_np, T_matrix, (canvas_w, canvas_h))
 
-    # 创建单通道掩码 (判断哪些像素有内容，避免黑色背景干扰)
-    mask_A = (np.sum(canvas_A, axis=2) > 0).astype(np.float32)[..., np.newaxis]
-    mask_B = (np.sum(canvas_B, axis=2) > 0).astype(np.float32)[..., np.newaxis]
+def multi_band_blending(img_a: np.ndarray, img_b: np.ndarray, mask_a: np.ndarray, mask_b: np.ndarray,
+                        num_bands: int = 5):
+    """多频段无缝融合"""
+    H, W = img_a.shape[:2]
+    bounding_rect = (0, 0, W, H)
 
-    # 计算重叠区域掩码
-    overlap_mask = mask_A * mask_B
+    img_a_16s = img_a.astype(np.int16)
+    img_b_16s = img_b.astype(np.int16)
 
-    # 设置透明度参数 (0.5 表示在重叠区 A 和 B 各占 50% 的权重)
-    alpha = 0.5
+    blender = cv2.detail_MultiBandBlender()
+    blender.setNumBands(num_bands)
+    blender.prepare(bounding_rect)
 
-    # 融合逻辑切分
-    # 1. 仅存在图 A 的非重叠区域
-    only_A_area = canvas_A * mask_A * (1 - overlap_mask)
-    # 2. 仅存在图 B 的非重叠区域
-    only_B_area = canvas_B * mask_B * (1 - overlap_mask)
-    # 3. 重叠区域进行透明度加权融合
-    blended_overlap = (canvas_A * alpha + canvas_B * (1 - alpha)) * overlap_mask
+    blender.feed(img_a_16s, mask_a, (0, 0))
+    blender.feed(img_b_16s, mask_b, (0, 0))
 
-    # 组合为最终拼接图
-    stitched_img = only_A_area + only_B_area + blended_overlap
-    stitched_img = np.clip(stitched_img, 0, 1)
+    dst = np.zeros((H, W, img_a.shape[2]), dtype=np.int16)
+    dst_mask = np.zeros((H, W), dtype=np.uint8)
+    result, result_mask = blender.blend(dst, dst_mask)
 
-    # 8. 绘制结果
-    plt.figure(figsize=(18, 6))
-    
-    plt.subplot(1, 3, 1)
-    plt.title("Image A (Target)")
-    plt.imshow(img_A_np)
-    plt.axis('off')
-    
-    plt.subplot(1, 3, 2)
-    plt.title("Image B (Source)")
-    plt.imshow(img_B_np)
-    plt.axis('off')
-    
-    plt.subplot(1, 3, 3)
-    plt.title("Stitched Panorama")
-    plt.imshow(stitched_img)
-    plt.axis('off')
+    result_8u = np.clip(result, 0, 255).astype(np.uint8)
+    return result_8u
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200, bbox_inches='tight')
-    plt.close()
-    print(f"拼接可视化已完成，结果保存至 {save_path}")
 
-def main():
-    parser = argparse.ArgumentParser(description="AgriMatcher Inference Script")
-    parser.add_argument("--img_a", type=str, required=True, help="Path to the first image (Target)")
-    parser.add_argument("--img_b", type=str, required=True, help="Path to the second image (Source)")
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to the saved checkpoint (e.g., best.pt)")
-    parser.add_argument("--image_size", type=int, default=256, help="Image size used during training")
-    parser.add_argument("--d_model", type=int, default=128, help="Model dimension")
-    parser.add_argument("--teacher_dim", type=int, default=80, help="Teacher feature dimension (must match training)")
-    parser.add_argument("--out", type=str, default="visres.jpg", help="Output visualization path")
-    args = parser.parse_args()
-
+@torch.no_grad()
+def inference(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"🚀 初始化全景推理引擎 ({device})...")
 
-    # 1. 计算 grid_size 并初始化模型
-    grid_size = args.image_size // 8
-    print(f"Initializing AgriMatcher (image_size={args.image_size}, grid_size={grid_size}, teacher_dim={args.teacher_dim})...")
-    
-    student = AgriMatcher(
-        d_model=args.d_model, 
-        teacher_dim=args.teacher_dim, 
-        grid_size=grid_size
+    # 1. 实例化与加载权重
+    student = AgriTPSStitcher(
+        matcher_config={'d_model': 128, 'teacher_dim': 100, 'grid_size': 32},
+        tps_config={'grid_size': 8, 'feat_channels': 128}
     ).to(device)
-
-    # 2. 加载权重
-    print(f"Loading checkpoint from {args.ckpt}...")
-    ckpt_path = Path(args.ckpt)
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found at {args.ckpt}")
-        
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-    
-    # 使用 strict=False 加载，以防结构有微调
-    missing_keys, unexpected_keys = student.load_state_dict(checkpoint["student"], strict=False)
-    if missing_keys:
-        print(f"Warning: Missing keys in state_dict: {missing_keys}")
-    if unexpected_keys:
-        print(f"Warning: Unexpected keys in state_dict: {unexpected_keys}")
-        
     student.eval()
 
-    # 3. 加载并预处理图像
-    print(f"Processing images: A={args.img_a}, B={args.img_b}...")
-    img_a_tensor = load_rgb_tensor(Path(args.img_a), args.image_size).unsqueeze(0).to(device)
-    img_b_tensor = load_rgb_tensor(Path(args.img_b), args.image_size).unsqueeze(0).to(device)
+    checkpoint = torch.load(args.ckpt, map_location=device, weights_only=False)
+    student.load_state_dict(checkpoint['student'], strict=True)
 
-    # 4. 前向推理
-    print("Running inference...")
-    with torch.no_grad():
-        # 根据训练脚本，使用 AMP 进行半精度推理
-        with torch.autocast(device_type=device.type, dtype=torch.float16):
-            output = student(img_a_tensor, img_b_tensor)
-            
-            warp_AB = output['warp_AB'].float() # 转回 float32 供 grid_sample 使用
-            
-            # 提取置信度，处理可能存在的 Logits 情况
-            if 'confidence_AB' in output:
-                confidence_AB = output['confidence_AB'].float()
-            elif 'conf_logits' in output:
-                # 如果网络输出的是 logits，则需要应用 sigmoid
-                confidence_AB = torch.sigmoid(output['conf_logits']).float()
-            else:
-                confidence_AB = None
+    # 2. 读取原图
+    img_a_orig = cv2.imread(str(args.img_a))
+    img_b_orig = cv2.imread(str(args.img_b))
+    H_a, W_a = img_a_orig.shape[:2]
+    H_b, W_b = img_b_orig.shape[:2]
 
-    # 5. 可视化结果
-    print("Generating stitching visualization...")
-    visualize_stitching_result(
-        img_a_tensor, 
-        img_b_tensor, 
-        warp_AB, 
-        confidence_AB, 
-        save_path=args.out,
-        # conf_thresh=args.conf_thresh
-        conf_thresh=0.5
-    )
-    print("Done.")
+    # 3. 网络推理获取网格和全局 H
+    net_h, net_w = 512, 512
+    img_a_net = cv2.resize(img_a_orig, (net_w, net_h))
+    img_b_net = cv2.resize(img_b_orig, (net_w, net_h))
+
+    mean, std = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
+    tensor_a = torch.from_numpy((cv2.cvtColor(img_a_net, cv2.COLOR_BGR2RGB) / 255.0 - mean) / std).permute(2, 0,
+                                                                                                           1).float().unsqueeze(
+        0).to(device)
+    tensor_b = torch.from_numpy((cv2.cvtColor(img_b_net, cv2.COLOR_BGR2RGB) / 255.0 - mean) / std).permute(2, 0,
+                                                                                                           1).float().unsqueeze(
+        0).to(device)
+
+    start_time = time.time()
+    out = student(tensor_a, tensor_b)
+    dense_grid = out['dense_grid']
+    H_mat = out['H_mat'][0].cpu().numpy()  # 网络输出的是 [-1,1] 归一化空间的 H
+    print(f"⚡ 推理耗时: {(time.time() - start_time) * 1000:.2f} ms")
+
+    # =========================================================================
+    # 🌟 核心：计算真正的全景画布尺寸 (严格按照归一化空间映射)
+    # =========================================================================
+    H_inv = np.linalg.inv(H_mat)
+
+    # 获取图 B 的 4 个像素角点，并转到 [-1, 1] 空间
+    corners_b_pix = np.array([[0, 0], [W_b, 0], [W_b, H_b], [0, H_b]], dtype=np.float32)
+    corners_b_norm = np.copy(corners_b_pix)
+    corners_b_norm[:, 0] = (corners_b_norm[:, 0] + 0.5) * (2.0 / W_b) - 1.0
+    corners_b_norm[:, 1] = (corners_b_norm[:, 1] + 0.5) * (2.0 / H_b) - 1.0
+
+    # 投影到 A 的 [-1, 1] 空间
+    pts_b = np.vstack([corners_b_norm.T, np.ones(4)])
+    pts_a_norm = H_inv @ pts_b
+    pts_a_norm = pts_a_norm[:2, :] / pts_a_norm[2, :]
+
+    # 转回 A 的绝对像素空间
+    corners_a_pix = pts_a_norm.T
+    corners_a_pix[:, 0] = ((corners_a_pix[:, 0] + 1.0) / 2.0) * W_a - 0.5
+    corners_a_pix[:, 1] = ((corners_a_pix[:, 1] + 1.0) / 2.0) * H_a - 0.5
+
+    # 计算包含 A 和 B 的全景 Bounding Box
+    all_x = np.concatenate([corners_a_pix[:, 0], [0, W_a]])
+    all_y = np.concatenate([corners_a_pix[:, 1], [0, H_a]])
+    min_x, max_x = np.min(all_x), np.max(all_x)
+    min_y, max_y = np.min(all_y), np.max(all_y)
+
+    W_pano = int(np.ceil(max_x - min_x))
+    H_pano = int(np.ceil(max_y - min_y))
+    tx, ty = int(round(-min_x)), int(round(-min_y))
+    print(f"🌍 动态扩充全景画布: {W_pano}x{H_pano}, 偏移基准: ({tx}, {ty})")
+
+    # =========================================================================
+    # 🌟 核心：生成 宏观(Homography) + 微观(TPS) 混合渲染网格
+    # =========================================================================
+    # 1. 铺设全景底网 (利用全局单应性)
+    grid_y, grid_x = np.mgrid[0:H_pano, 0:W_pano].astype(np.float32)
+    # 转为 A 像素坐标 -> A 归一化坐标
+    nx_a = (grid_x - tx + 0.5) * (2.0 / W_a) - 1.0
+    ny_a = (grid_y - ty + 0.5) * (2.0 / H_a) - 1.0
+
+    # 映射到 B 归一化坐标 -> B 像素坐标
+    pts_a_flat = np.stack([nx_a.ravel(), ny_a.ravel(), np.ones_like(nx_a.ravel())])
+    pts_b_norm = H_mat @ pts_a_flat
+    nx_b = (pts_b_norm[0] / pts_b_norm[2]).reshape(H_pano, W_pano)
+    ny_b = (pts_b_norm[1] / pts_b_norm[2]).reshape(H_pano, W_pano)
+
+    map_x_pano = ((nx_b + 1.0) / 2.0) * W_b - 0.5
+    map_y_pano = ((ny_b + 1.0) / 2.0) * H_b - 0.5
+    map_x_pano, map_y_pano = map_x_pano.astype(np.float32), map_y_pano.astype(np.float32)
+
+    # 2. 局部高精度覆写：将含有水波纹的 TPS 形变嵌入重叠区
+    map_x_tps, map_y_tps = torch_grid_to_cv2_map(dense_grid, H_a, W_a)
+    map_x_pano[ty:ty + H_a, tx:tx + W_a] = map_x_tps
+    map_y_pano[ty:ty + H_a, tx:tx + W_a] = map_y_tps
+
+    # =========================================================================
+    # 🌟 最终渲染与融合
+    # =========================================================================
+    warped_b_pano = cv2.remap(img_b_orig, map_x_pano, map_y_pano, interpolation=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_CONSTANT)
+
+    img_a_pano = np.zeros((H_pano, W_pano, 3), dtype=np.uint8)
+    img_a_pano[ty:ty + H_a, tx:tx + W_a] = img_a_orig
+
+    # 生成精确 Mask
+    mask_a_pano = np.zeros((H_pano, W_pano), dtype=np.uint8)
+    mask_a_pano[ty:ty + H_a, tx:tx + W_a] = 255
+
+    mask_b_orig = np.ones((H_b, W_b), dtype=np.uint8) * 255
+    mask_b_pano = cv2.remap(mask_b_orig, map_x_pano, map_y_pano, interpolation=cv2.INTER_NEAREST,
+                            borderMode=cv2.BORDER_CONSTANT)
+
+    print(f"✨ 执行多频段无缝融合...")
+    blend_mask_a, blend_mask_b = generate_voronoi_seam_masks(mask_a_pano, mask_b_pano)
+    final_panorama = multi_band_blending(img_a_pano, warped_b_pano, blend_mask_a, blend_mask_b, num_bands=5)
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), final_panorama)
+    print(f"🎉 真正的全景拼接成功！已保存至: {out_path.absolute()}")
+
+    # 依然保留 Overlap 用来发论文对比
+    overlap = cv2.addWeighted(img_a_pano, 0.5, warped_b_pano, 0.5, 0)
+    cv2.imwrite(str(out_path.with_name(f"{out_path.stem}_overlap{out_path.suffix}")), overlap)
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="AgriTPSStitcher 真正的高清全景生成器")
+    parser.add_argument("--img-a", type=str, required=True, help="基准图片")
+    parser.add_argument("--img-b", type=str, required=True, help="待拼接图片")
+    parser.add_argument("--ckpt", type=str, required=True, help="权重路径")
+    parser.add_argument("--out", type=str, default="output/panorama.jpg", help="输出路径")
+    args = parser.parse_args()
+    inference(args)

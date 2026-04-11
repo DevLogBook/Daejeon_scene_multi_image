@@ -98,8 +98,8 @@ class ConfidenceWeightedVotingDynamic(nn.Module):
         dist2 = (a_sq + b_sq - 2 * ab).clamp(min=0.0)
 
         kernel = torch.exp(-dist2 / (2 * self.sigma ** 2))
-        kernel = kernel / (kernel.sum(1, keepdim=True) + 1e-8)  # Nadaraya-Watson
-        return kernel
+        kernel = kernel / (kernel.sum(1, keepdim=True) + 1e-8)
+        return kernel.detach()
 
     def _get_cached_kernel(
         self, H: int, W: int,
@@ -237,11 +237,11 @@ class FlowAggregator(nn.Module):
 
     def __init__(
         self,
-        grid_size: int = 10,
+        grid_size: int = 8,
         feat_channels: int = 128,
         hidden_ch: int = 48,
         in_ch: int = 5,
-        delta_scale: float = 0.25,
+        delta_scale: float = 0.15,
     ):
         super().__init__()
         self.grid_size  = grid_size
@@ -251,7 +251,7 @@ class FlowAggregator(nn.Module):
 
         # 特征一致性头：(feat_A, feat_B) → 1通道一致性图
         self.consistency_head = nn.Sequential(
-            nn.Conv2d(feat_channels * 2, 32, 1, bias=False),
+            nn.Conv2d(feat_channels * 3, 32, 1, bias=False),  # 🚀 修复：改为 * 3
             nn.BatchNorm2d(32), nn.GELU(),
             nn.Conv2d(32, 1, 1),
             nn.Sigmoid(),
@@ -468,12 +468,12 @@ class BypassTPSEstimator(nn.Module):
 
     def __init__(
         self,
-        grid_size: int = 10,
+        grid_size: int = 8,
         feat_channels: int = 128,
         hidden_ch: int = 48,
         flow_map_size: int = 64,
         sigma_scale: float = 0.7,
-        delta_scale: float = 0.5,
+        delta_scale: float = 0.15,
         use_entropy: bool = True,
         use_cf_consistency: bool = True,
     ):
@@ -491,9 +491,6 @@ class BypassTPSEstimator(nn.Module):
         if use_cf_consistency:
             self.cf_consistency_module = CoarseFineConsistency()
 
-        # ── 静态确定输入通道数 ──
-        # base: flow(2) + conf(1) + coverage(1) + feat_consistency(1) = 5
-        # 可选: anti_entropy(1) + cf_consistency(1)
         base_ch  = 5
         extra_ch = int(use_entropy) + int(use_cf_consistency)
         total_in_ch = base_ch + extra_ch   # 5, 6, 或 7（固定，不受运行时条件影响）
@@ -528,6 +525,11 @@ class BypassTPSEstimator(nn.Module):
         dense_field: Optional[torch.Tensor] = None,     # (B,H,W,2) TPS输出，用于密集折叠
         coarse_hw: Optional[Tuple[int, int]] = None
     ) -> Dict[str, torch.Tensor]:
+        if self.training:
+            warp_AB = warp_AB.detach()
+            confidence = confidence.detach()
+            feat_A = feat_A
+            feat_B = feat_B
 
         B, H, W, _ = warp_AB.shape
         device, dtype = warp_AB.device, warp_AB.dtype
@@ -546,8 +548,8 @@ class BypassTPSEstimator(nn.Module):
 
         # 特征一致性（feat_A & feat_B → 1通道）
         feat_consistency = self.aggregator.consistency_head(
-            torch.cat([feat_A, feat_B], dim=1)
-        )  # (B,1,H,W)
+            torch.cat([feat_A, feat_B, torch.abs(feat_A - feat_B)], dim=1)
+        )
 
         # 覆盖度图上采样到flow分辨率
         cov_up = F.interpolate(
@@ -644,7 +646,9 @@ class TPSGridGenerator(nn.Module):
         L[:grid_size ** 2, grid_size ** 2:] = P
         L[grid_size ** 2:, :grid_size ** 2] = P.t()
         # 增加微小偏置确保矩阵可逆
-        self.register_buffer("L_inv", torch.inverse(L + torch.eye(L.shape[0]) * 1e-6))
+        reg = torch.eye(L.shape[0]) * 1e-6
+        reg[grid_size ** 2:, grid_size ** 2:] = 0.0  # 右下 3×3 不加扰动
+        self.register_buffer("L_inv", torch.inverse(L + reg))
 
         # 初始化缓存字典 (针对不同分辨率 H, W)
         self._cache = {}
@@ -675,7 +679,7 @@ class TPSGridGenerator(nn.Module):
 
             K_pix = self._tps_kernel(dist_pix_cp)
             P_pix = torch.cat([torch.ones(H * W, 1, device=device, dtype=dtype), p_tgt_pix], dim=1)
-            self._cache[key] = (K_pix, P_pix)
+            self._cache[key] = (K_pix.detach(), P_pix.detach())
 
         K_pix, P_pix = self._cache[key]
 

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from dense_match.backbone import MobileViTBackbone
 from dense_match.refine import (WarpRefiner,
                                 upsample_warp_and_overlap,
-                                make_grid)
+                                make_grid, safe_grid_sample)
 from dense_match.flow_to_tps import BypassTPSEstimator, TPSGridGenerator
 
 
@@ -73,6 +73,32 @@ class MatchWindowAttention(nn.Module):
             nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, d_model)
         )
 
+        # --- NEW: Generate and register local window positional encoding ---
+        local_pe = self._generate_2d_sincos_pe(window_size, d_model)
+        self.register_buffer('local_pe', local_pe)
+
+    def _generate_2d_sincos_pe(self, window_size, d_model):
+        """Generates 2D sine-cosine positional encoding for the local window."""
+        pe = torch.zeros(window_size * window_size, d_model)
+        d_half = d_model // 2
+
+        # Create 2D grid coordinates for the window
+        y_pos = torch.arange(window_size).unsqueeze(1).repeat(1, window_size).flatten().float()
+        x_pos = torch.arange(window_size).unsqueeze(0).repeat(window_size, 1).flatten().float()
+
+        # Calculate div term
+        div_term = torch.exp(torch.arange(0, d_half, 2).float() * (-math.log(10000.0) / d_half))
+
+        # Apply sin/cos to y coordinates (first half of channels)
+        pe[:, 0:d_half:2] = torch.sin(y_pos.unsqueeze(1) * div_term)
+        pe[:, 1:d_half:2] = torch.cos(y_pos.unsqueeze(1) * div_term)
+
+        # Apply sin/cos to x coordinates (second half of channels)
+        pe[:, d_half::2] = torch.sin(x_pos.unsqueeze(1) * div_term)
+        pe[:, d_half + 1::2] = torch.cos(x_pos.unsqueeze(1) * div_term)
+
+        return pe.unsqueeze(0)  # Shape: [1, window_size*window_size, d_model]
+
     def window_partition(self, x, H, W):
         """将特征图划分为窗口"""
         B, N, C = x.shape
@@ -101,6 +127,9 @@ class MatchWindowAttention(nn.Module):
         short_cut_A, short_cut_B = feat_A, feat_B
         win_A, (Hp, Wp) = self.window_partition(feat_A, H, W)
         win_B, _ = self.window_partition(feat_B, H, W)
+
+        win_A = win_A + self.local_pe
+        win_B = win_B + self.local_pe
 
         # Local Cross Attention (A attends to B within the same window)
         # 这里的逻辑是：只在对应的空间窗口内寻找匹配，适合位移不大的精细化匹配
@@ -157,8 +186,8 @@ class LocalGeometricValidator(nn.Module):
         var_disp = (mean_sq - mean_disp ** 2).clamp(min=0.0)  # [B*K, 2, H, W]
 
         total_var = var_disp.sum(dim=1).reshape(B, K, N)  # [B, K, N]
-        score = 1.0 / (1.0 + total_var * 100.0)           # [B, K, N]
-        return score.permute(0, 2, 1)                       # [B, N, K]
+        score = 1.0 / (1.0 + total_var * 100.0)  # [B, K, N]
+        return score.permute(0, 2, 1)  # [B, N, K]
 
 
 class MultiPeakAwareAttention(nn.Module):
@@ -214,16 +243,19 @@ class MultiPeakAwareAttention(nn.Module):
         log_assign = self.optimal_transport(scores)
 
         ot_prob_matrix = torch.exp(log_assign)
+
+        # 计算全局概率分布，确保梯度能流向相似度矩阵的每一个角落
+        prob_dist = ot_prob_matrix / (ot_prob_matrix.sum(dim=-1, keepdim=True) + 1e-8)
+
+        base_expected_pos_B = torch.bmm(prob_dist.to(pos_B.dtype), pos_B)
+
         topk_values, topk_indices = ot_prob_matrix.topk(self.top_k, dim=-1)
 
-        # 用于最终 warp 输出的 B 图绝对物理坐标
         topk_positions = torch.gather(
             pos_B.unsqueeze(1).expand(-1, N, -1, -1),
             dim=2,
             index=topk_indices.unsqueeze(-1).expand(-1, -1, -1, 2)
         )
-
-        # 消除旋转/透视引起的大方差，只检测纯粹的非刚性错位
         topk_positions_for_geo = torch.gather(
             pos_B_for_geo.unsqueeze(1).expand(-1, N, -1, -1),
             dim=2,
@@ -232,12 +264,14 @@ class MultiPeakAwareAttention(nn.Module):
 
         geo_scores = self.geometric_validator(pos_A, topk_positions_for_geo, H, W)
         geo_weight = self.geo_weight.clamp(0.0, 2.0)
+
+        # 将几何得分转化为对 Top-K 坐标的局部微调
         combined_scores = topk_values + geo_weight * geo_scores
-
         soft_weights = F.softmax(combined_scores / current_temp, dim=-1)
-        refined_warp = (topk_positions * soft_weights.unsqueeze(-1)).sum(dim=2)
+        geo_refined_offset = (topk_positions * soft_weights.unsqueeze(-1)).sum(dim=2) - base_expected_pos_B.detach()
 
-        prob_dist = ot_prob_matrix / (ot_prob_matrix.sum(dim=-1, keepdim=True) + 1e-8)
+        refined_warp = base_expected_pos_B + geo_refined_offset
+
         entropy = -(prob_dist * (prob_dist + 1e-8).log()).sum(dim=-1)
 
         return refined_warp, entropy, raw_sim_matrix, geo_scores
@@ -275,79 +309,235 @@ def tensor_DLT(src_p, dst_p):
     return H
 
 
-def solve_weighted_affine(src_pts: torch.Tensor,
-                           dst_pts: torch.Tensor,
-                           weights: torch.Tensor) -> torch.Tensor:
+class ContextAwareInlierPredictor(nn.Module):
     """
-    用置信度加权最小二乘求解仿射变换矩阵（6自由度）。
-    比 DLT 单应矩阵更稳定，对无人机小视角差场景更合适。
+    NG-RANSAC 风格的上下文感知内点权重预测器。
+      1. 置换不变性 (Permutation Invariance)
+         使用 1D 卷积（PointNet 范式）处理 [B, C, N] 的无序点集，
+         打乱 N 维顺序不影响任何单点的权重输出。
+      2. 全局上下文感知 (Global Context)
+         全局最大池化提取"大部队运动趋势"，与每个点的局部特征拼接，
+         让每个点知道自己是否符合全局共识（重复纹理假匹配的克星）。
+      3. 特征-几何深度融合 (Feature-Geometry Fusion)
+         输入同时包含：
+           - 几何坐标差 [x_A, y_A, x_B, y_B]                (4 维)
+           - 特征绝对差  |feat_A - feat_B|（按通道压缩后）  (feat_compress_dim 维)
+           - 特征 Hadamard 积  feat_A * feat_B（同上）       (feat_compress_dim 维)
+         语义不一致的假匹配即使残差合理，也会被特征差异识破。
 
-    src_pts:  [B, N, 2]  float32
-    dst_pts:  [B, N, 2]  float32
-    weights:  [B, N, 1]  float32，置信度权重
-
-    返回: H_mat [B, 3, 3] float32，以单应矩阵格式输出，第3行为 [0,0,1]
+    输入:
+        pos_A:    [B, N, 2]
+        pos_B:    [B, N, 2]
+        feat_A:   [B, N, C]
+        feat_B:   [B, N, C]
+    输出:
+        weights:  [B, N, 1]  ∈ (0, 1)，用于加权 DLT
     """
+
+    def __init__(
+            self,
+            feat_dim: int = 128,
+            feat_compress_dim: int = 32,
+            hidden_dim: int = 128,
+            num_layers: int = 3,
+    ):
+        super().__init__()
+        self.feat_compress = nn.Sequential(
+            nn.Linear(feat_dim * 2, feat_compress_dim * 2),
+            nn.LayerNorm(feat_compress_dim * 2),
+            nn.GELU(),
+            nn.Linear(feat_compress_dim * 2, feat_compress_dim),
+        )
+
+        # PointNet: 1D conv 处理无序点集 [B, C_in, N]
+        # 输入维度：4 (坐标) + feat_compress_dim (特征融合)
+        in_dim = 4 + feat_compress_dim
+        layers = []
+        prev = in_dim
+        for i in range(num_layers):
+            out = hidden_dim
+            layers += [
+                nn.Conv1d(prev, out, 1, bias=False),
+                nn.BatchNorm1d(out),
+                nn.ReLU(inplace=True),
+            ]
+            prev = out
+        self.local_encoder = nn.Sequential(*layers)
+
+        # 全局上下文融合后的输出头
+        # 输入：local(hidden_dim) + global(hidden_dim) → 权重
+        self.output_head = nn.Sequential(
+            nn.Conv1d(hidden_dim * 2, hidden_dim, 1, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim // 2, 1, bias=False),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim // 2, 1, 1),
+            nn.Sigmoid(),
+        )
+
+        # 初始化：输出层偏置设为正值，让网络初期倾向于给所有点中等权重
+        nn.init.constant_(self.output_head[-2].bias, 1.0)
+
+    def forward(
+            self,
+            pos_A: torch.Tensor,  # [B, N, 2]
+            pos_B: torch.Tensor,  # [B, N, 2]
+            feat_A: torch.Tensor,  # [B, N, C]
+            feat_B: torch.Tensor,  # [B, N, C]
+    ) -> torch.Tensor:  # [B, N, 1]
+        B, N, _ = pos_A.shape
+
+        # 特征融合
+        feat_diff = (feat_A - feat_B).abs()  # [B, N, C]
+        feat_prod = feat_A * feat_B  # [B, N, C]
+        feat_enc = self.feat_compress(
+            torch.cat([feat_diff, feat_prod], dim=-1)  # [B, N, 2C]
+        )  # [B, N, feat_compress_dim]
+
+        # 几何+特征拼接
+        coord_cat = torch.cat([pos_A, pos_B], dim=-1)  # [B, N, 4]
+        x = torch.cat([coord_cat, feat_enc], dim=-1)  # [B, N, 4+feat_compress_dim]
+
+        # PointNet: [B, N, C] → [B, C, N]
+        x = x.transpose(1, 2).contiguous()  # [B, C_in, N]
+        local_feat = self.local_encoder(x)  # [B, hidden_dim, N]
+
+        # 全局最大池化
+        global_feat = local_feat.max(dim=2, keepdim=True).values  # [B, hidden_dim, 1]
+        global_feat = global_feat.expand(-1, -1, N)  # [B, hidden_dim, N]
+
+        # 局部 + 全局融合 → 输出权重
+        fused = torch.cat([local_feat, global_feat], dim=1)  # [B, 2*hidden_dim, N]
+        weights = self.output_head(fused)  # [B, 1, N]
+        return weights.transpose(1, 2).contiguous()  # [B, N, 1]
+
+
+def hartley_normalize(pts: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    pts = pts.float()
+    B, N, _ = pts.shape
+    device = pts.device
+
+    centroid = pts.mean(dim=1, keepdim=True)
+    pts_c = pts - centroid
+
+    dist = (pts_c ** 2).sum(dim=-1).clamp(min=0.0).sqrt()
+    mean_dist = dist.mean(dim=1, keepdim=True)
+
+    is_degenerate = mean_dist < 1e-3
+    mean_dist_safe = mean_dist.clamp(min=1e-3)
+    scale = (2.0 ** 0.5) / mean_dist_safe
+    scale = torch.where(is_degenerate, torch.ones_like(scale), scale)
+
+    pts_norm = pts_c * scale.unsqueeze(-1)
+
+    cx = centroid[:, 0, 0]
+    cy = centroid[:, 0, 1]
+    s  = scale[:, 0]
+    zeros = torch.zeros_like(s)
+    ones  = torch.ones_like(s)
+
+    T = torch.stack([
+        s,     zeros, -s * cx,
+        zeros, s,     -s * cy,
+        zeros, zeros, ones,
+    ], dim=-1).reshape(B, 3, 3)
+
+    return pts_norm, T
+
+
+def solve_differentiable_dlt(src_pts, dst_pts, weights, reg_lambda=1e-4):
     B, N, _ = src_pts.shape
     device = src_pts.device
 
-    src_f32 = src_pts.float()
-    dst_f32 = dst_pts.float()
-    w_f32 = weights.float().squeeze(-1)  # [B, N]
+    # Hartley 归一化
+    src_norm, T_src = hartley_normalize(src_pts)   # T_src: 列向量约定
+    dst_norm, T_dst = hartley_normalize(dst_pts)
 
-    # 归一化权重
-    w_sum = w_f32.sum(dim=1, keepdim=True).clamp(min=1e-6)
-    w_norm = w_f32 / w_sum  # [B, N]
+    # 构造 DLT 矩阵（行向量约定：[x',y',1] = [x,y,1] @ H_norm.T）
+    sx, sy = src_norm[..., 0:1].float(), src_norm[..., 1:2].float()
+    dx, dy = dst_norm[..., 0:1].float(), dst_norm[..., 1:2].float()
+    zeros, ones = torch.zeros_like(sx), torch.ones_like(sx)
 
-    # 构建加权线性方程 Ax = b，其中 x = [a, b, c, d, e, f]（仿射参数）
-    # dst_x = a*src_x + b*src_y + c
-    # dst_y = d*src_x + e*src_y + f
-    x = src_f32[..., 0:1]  # [B, N, 1]
-    y = src_f32[..., 1:2]
-    ones = torch.ones_like(x)
-    zeros = torch.zeros_like(x)
+    row1 = torch.cat([sx, sy, ones, zeros, zeros, zeros, -dx*sx, -dx*sy], dim=-1)
+    row2 = torch.cat([zeros, zeros, zeros, sx, sy, ones, -dy*sx, -dy*sy], dim=-1)
+    A_full = torch.cat([row1, row2], dim=1)   # [B, 2N, 8]
+    b_full = torch.cat([dx, dy], dim=1)       # [B, 2N, 1]
 
-    # 每行：[x, y, 1, 0, 0, 0] 对应 dst_x
-    #       [0, 0, 0, x, y, 1] 对应 dst_y
-    row_x = torch.cat([x, y, ones, zeros, zeros, zeros], dim=-1)  # [B, N, 6]
-    row_y = torch.cat([zeros, zeros, zeros, x, y, ones], dim=-1)  # [B, N, 6]
+    # 3. 加权
+    w_scaled = weights.float().squeeze(-1)
+    w_diag   = torch.cat([w_scaled, w_scaled], dim=1).unsqueeze(-1)
+    Aw   = A_full * w_diag
+    AtWA = torch.bmm(Aw.transpose(1, 2), A_full)
+    AtWb = torch.bmm(Aw.transpose(1, 2), b_full)
 
-    A = torch.cat([row_x, row_y], dim=1)          # [B, 2N, 6]
-    b_vec = torch.cat([dst_f32[..., 0:1],
-                       dst_f32[..., 1:2]], dim=1)  # [B, 2N, 1]
+    reg_I = torch.eye(8, device=device, dtype=torch.float32).unsqueeze(0) * reg_lambda
+    h_id  = torch.tensor([1.,0.,0.,0.,1.,0.,0.,0.],
+                          device=device, dtype=torch.float32).view(1, 8, 1)
+    AtWA = AtWA + reg_I
+    AtWb = AtWb + reg_lambda * h_id
 
-    # 权重矩阵（对角）
-    w_diag = torch.cat([w_norm, w_norm], dim=1)   # [B, 2N]
-    w_diag = w_diag.unsqueeze(-1)                  # [B, 2N, 1]
+    with torch.amp.autocast('cuda', enabled=False):
+        try:
+            h8_final = torch.linalg.solve(AtWA.float(), AtWb.float()).squeeze(-1)
+            if not torch.isfinite(h8_final).all():
+                raise RuntimeError("Non-finite")
+        except Exception:
+            h8_final = h_id.squeeze(-1).expand(B, 8).float()
 
-    # 加权正规方程：(A^T W A) x = A^T W b
-    Aw = A * w_diag          # [B, 2N, 6]
-    AtWA = torch.bmm(Aw.transpose(1, 2), A)   # [B, 6, 6]
-    AtWb = torch.bmm(Aw.transpose(1, 2), b_vec)  # [B, 6, 1]
+    h8_final = h8_final.to(src_pts.dtype)
+    h1,h2,h3,h4,h5,h6,h7,h8_ = h8_final.unbind(dim=-1)
+    ones_b = torch.ones_like(h1)
+    # H_norm 满足（行向量约定）：dst_norm_homo = src_norm_homo @ H_norm.T
+    H_norm = torch.stack([h1,h2,h3,h4,h5,h6,h7,h8_,ones_b],
+                          dim=-1).reshape(B, 3, 3)
 
-    # 正则化防止病态
-    reg = torch.eye(6, device=device, dtype=torch.float32).unsqueeze(0) * 1e-4
-    AtWA = AtWA + reg
+    T_src_f = T_src.float()
+    T_dst_f = T_dst.float()
 
-    # 求解
-    try:
-        params = torch.linalg.solve(AtWA, AtWb).squeeze(-1)  # [B, 6]
-    except RuntimeError:
-        # 退化情况：返回单位矩阵
-        params = torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float32,
-                               device=device).unsqueeze(0).expand(B, -1)
-
-    # 组装为 3×3 齐次矩阵
-    a, b, c, d, e, f = params.unbind(dim=-1)
-    zeros_b = torch.zeros_like(a)
-    ones_b = torch.ones_like(a)
-    H_mat = torch.stack([
-        a, b, c,
-        d, e, f,
-        zeros_b, zeros_b, ones_b
+    # T_dst 解析逆：T^{-1} = [[1/s, 0, cx], [0, 1/s, cy], [0, 0, 1]]
+    s_dst  = T_dst_f[:, 0, 0].clamp(min=1e-6)
+    cx_dst = -T_dst_f[:, 0, 2] / s_dst                 # [B]
+    cy_dst = -T_dst_f[:, 1, 2] / s_dst
+    inv_s  = 1.0 / s_dst
+    z      = torch.zeros_like(inv_s)
+    o      = torch.ones_like(inv_s)
+    T_dst_inv = torch.stack([
+        inv_s, z,     cx_dst,
+        z,     inv_s, cy_dst,
+        z,     z,     o,
     ], dim=-1).reshape(B, 3, 3)
 
-    return H_mat
+    H_actual = torch.bmm(T_dst_inv, torch.bmm(H_norm.float(), T_src_f))
+
+    # 归一化 H[2,2] = 1
+    H_actual = H_actual / (H_actual[:, 2:3, 2:3].abs().clamp(min=1e-8))
+
+    h33 = H_actual[:, 2:3, 2:3]
+
+    # 提取符号（防止0导致符号丢失）
+    h33_sign = h33.sign()
+    h33_sign = torch.where(h33_sign == 0, torch.ones_like(h33_sign), h33_sign)
+
+    # 归一化：除以 h33 自身（带符号，防0），确保右下角永远是绝对的 +1
+    safe_h33 = h33.abs().clamp(min=1e-8) * h33_sign
+    H_actual = H_actual / safe_h33
+    H_finite = torch.isfinite(H_actual).all(dim=(-2, -1))  # [B]
+    h33_ok = H_actual[:, 2, 2].abs().clamp(1e-6, 1e6)
+    h33_ok = (H_actual[:, 2, 2].abs() > 1e-4) & \
+             (H_actual[:, 2, 2].abs() < 1e4)  # [B]
+    valid = H_finite & h33_ok
+
+    if not valid.all():
+        eye = torch.eye(3, device=H_actual.device,
+                        dtype=H_actual.dtype).unsqueeze(0).expand(B, -1, -1)
+        H_actual = torch.where(
+            valid.view(B, 1, 1).expand_as(H_actual),
+            H_actual, eye
+        )
+
+    return H_actual.to(src_pts.dtype)
 
 
 class AgriMatcher(nn.Module):
@@ -370,7 +560,7 @@ class AgriMatcher(nn.Module):
         ])
         self.peak_aware_layer = MultiPeakAwareAttention(d_model=d_model, top_k=4)
 
-        self.temperature = nn.Parameter(torch.tensor(0.7))
+        self.temperature = nn.Parameter(torch.tensor(1.0))  # 从高温开始，由优化器逐步衰减
         self.feature_projector = nn.Linear(d_model, teacher_dim)
 
         self.coord_embed = nn.Linear(2, d_model)
@@ -392,6 +582,15 @@ class AgriMatcher(nn.Module):
             num_blocks=1,
             max_pixel_delta=4,
             residual_overlap=True,
+        )
+
+        # ContextAwareInlierPredictor: NG-RANSAC 风格的语义引导权重头
+        # 替代纯几何 margin 权重，解决重复纹理欺骗 IRLS 的漏洞
+        self.inlier_predictor = ContextAwareInlierPredictor(
+            feat_dim=d_model,
+            feat_compress_dim=32,
+            hidden_dim=128,
+            num_layers=3,
         )
 
     def forward(self, img_A, img_B, H_prior=None):
@@ -432,14 +631,15 @@ class AgriMatcher(nn.Module):
             # 将 B 特征按预测的对应关系 warp 到 A 坐标系
             # expected_pos_B: [B, N, 2] → reshape → [B, Hc, Wc, 2]（作为 grid）
             warp_grid_tmp = expected_pos_B.reshape(B, Hc, Wc, 2)
-            # grid_sample 需要 feat_B 在 [B, C, H, W] 格式
-            feat_B_chw = feat_B_pos.transpose(1, 2).reshape(B, -1, Hc, Wc)
-            # 将 B 的特征 warp 到 A 的空间位置
-            feat_B_warped_chw = F.grid_sample(
-                feat_B_chw.float(), warp_grid_tmp.float(),
-                mode='bilinear', padding_mode='border', align_corners=False
-            ).to(feat_B_pos.dtype)
-            feat_B_warped = feat_B_warped_chw.reshape(B, -1, Hc * Wc).transpose(1, 2)  # [B, N, C]
+
+        # grid_sample 需要 feat_B 在 [B, C, H, W] 格式
+        feat_B_chw = feat_B_pos.transpose(1, 2).reshape(B, -1, Hc, Wc)
+        # 将 B 的特征 warp 到 A 的空间位置
+        feat_B_warped_chw = F.grid_sample(
+            feat_B_chw.float(), warp_grid_tmp.float(),
+            mode='bilinear', padding_mode='zeros', align_corners=False
+        ).to(feat_B_pos.dtype)
+        feat_B_warped = feat_B_warped_chw.reshape(B, -1, Hc * Wc).transpose(1, 2)  # [B, N, C]
 
         # 两层窗口注意力：在已对齐的坐标系内做局部精细匹配
         feat_A_pos, feat_B_warped = self.attn_layers[1](feat_A_pos, feat_B_warped, Hc, Wc)
@@ -447,10 +647,8 @@ class AgriMatcher(nn.Module):
 
         feat_A_pos, _ = self.attn_layers[3](feat_A_pos, feat_B_warped)
 
-        # 注意：feat_B_pos 在窗口层之后需要单独处理，因为 feat_B_warped 已经对齐到 A 坐标系
-        # 最终匹配使用原始 feat_B_pos 做相似度计算（保证坐标一致性）
         feat_A = feat_A_pos
-        feat_B = feat_B_pos
+        feat_B = feat_B_warped
 
         pos_A = self._get_token_coords(B, Hc, Wc, device, dtype)  # [B, N, 2]
         pos_B = pos_A
@@ -465,37 +663,39 @@ class AgriMatcher(nn.Module):
         sim_matrix = torch.bmm(norm_A, norm_B.transpose(1, 2)) / temp
         prob_A_to_B = F.softmax(sim_matrix, dim=-1)  # fp32
 
-        # 提前提取分类特征
+        # 分类特征（用于 conf_head 输入）
         top2_vals = torch.topk(prob_A_to_B, k=2, dim=-1).values
         top1_prob = top2_vals[..., 0:1]
         top2_prob = top2_vals[..., 1:2]
         margin = top1_prob - top2_prob
-        entropy = -(prob_A_to_B * torch.log(prob_A_to_B.clamp_min(1e-8))).sum(dim=-1, keepdim=True)
+        prob_fp32 = prob_A_to_B.float()
+        entropy = -(prob_fp32 * torch.log(prob_fp32.clamp_min(1e-6))).sum(
+            dim=-1, keepdim=True
+        ).to(prob_A_to_B.dtype)
 
+        # 先用粗略期望坐标为 PeakAwareLayer 提供 H 先验去畸变
+        # 注意：这里的 H 只用于 pos_B_for_geo（几何验证辅助），不是最终输出的 H_base
         pos_B_for_geo = pos_B
-        with torch.no_grad():  # 纯几何计算，不干扰主干梯度
-            if H_prior is None:
-                # 网络内部自适应估算初始 H_prior (零外部依赖)
-                expected_pos_B = torch.bmm(prob_A_to_B.to(dtype), pos_B)
-                # 使用最高置信度的区域算出大体的仿射/透视形变
-                H_to_invert = solve_weighted_affine(pos_A.detach(), expected_pos_B.detach(), margin.detach())
-            else:
-                # 使用外部传入的先验
-                H_to_invert = H_prior
-
-            # 求逆矩阵：将 B 图的物理网格强行投影回 A 图所在的无畸变共面空间
+        with torch.no_grad():
+            expected_pos_B_crude = torch.bmm(prob_A_to_B.to(dtype), pos_B)
+            # 用粗略 margin 权重算一个仅供 LocalGeometricValidator 去畸变用的临时 H
+            H_for_geo = solve_differentiable_dlt(
+                pos_A.detach(), expected_pos_B_crude.detach(), margin.detach()
+            )
             try:
-                H_inv = torch.linalg.inv(H_to_invert.float())
+                H_geo_inv = torch.linalg.inv(H_for_geo.float())
             except RuntimeError:
-                H_inv = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).expand(B, -1, -1)
+                H_geo_inv = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).expand(B, -1, -1)
 
             pb_homo = torch.cat([pos_B.float(), torch.ones(B, Hc * Wc, 1, device=device, dtype=torch.float32)], dim=-1)
-            pb_in_A = torch.bmm(pb_homo, H_inv.transpose(1, 2))
-
-            safe_z = pb_in_A[..., 2:3].clamp(min=1e-3)
+            pb_in_A = torch.bmm(pb_homo, H_geo_inv.transpose(1, 2))
+            z_A = pb_in_A[..., 2:3]
+            sign_A = z_A.sign()
+            sign_A = torch.where(sign_A == 0, torch.ones_like(sign_A), sign_A)
+            safe_z = torch.where(z_A.abs() < 1e-3, 1e-3 * sign_A, z_A)
             pos_B_for_geo = (pb_in_A[..., :2] / safe_z).clamp(-10.0, 10.0).to(dtype)
 
-        # 将经过消除透视/旋转畸变后的基准坐标传给 PeakAwareLayer
+        # PeakAwareLayer：基于粗略去畸变坐标做几何验证
         refined_warp_coarse, match_entropy, raw_sim_matrix, geo_scores = self.peak_aware_layer(
             feat_A, feat_B, pos_A, pos_B, Hc, Wc, temp, pos_B_for_geo=pos_B_for_geo
         )
@@ -504,10 +704,10 @@ class AgriMatcher(nn.Module):
         feat_diff = torch.abs(feat_A - expected_feat_B)
         feat_prod = feat_A * expected_feat_B
 
-        pos_A_flat = pos_A 
+        pos_A_flat = pos_A
         warp_AB_coarse = refined_warp_coarse.reshape(B, Hc, Wc, 2)
 
-        # Confidence
+        # Confidence Head
         conf_input = torch.cat(
             [feat_diff, feat_prod, top1_prob, top2_prob, margin, entropy, pos_A_flat],
             dim=-1
@@ -515,19 +715,50 @@ class AgriMatcher(nn.Module):
         conf_logits_coarse = self.conf_head(conf_input).squeeze(-1).reshape(B, Hc, Wc)
         confidence_AB_coarse = torch.sigmoid(conf_logits_coarse)
 
+        # WarpRefiner
         warp_fine_init, overlap_fine_init = upsample_warp_and_overlap(
             warp_AB_coarse, confidence_AB_coarse, out_hw=(Hf, Wf)
         )
-
         warp_AB_fine, overlap_logits_fine, overlap_fine = self.refiner_64(
             feat_A=feat_A_fine,
             feat_B=feat_B_fine,
             prev_warp=warp_fine_init,
             prev_overlap=overlap_fine_init,
         )
-
         conf_logits_fine = overlap_logits_fine.squeeze(-1)
         confidence_AB_fine = overlap_fine.squeeze(-1)
+
+        # H 在 refine 后计算，用精化 warp 和 ContextAwareInlierPredictor
+        # 优势：
+        #   a) warp_AB_fine 已经经过 WarpRefiner 修正，残差更小，H 更准
+        #   b) ContextAwareInlierPredictor 用特征差异识别语义假匹配（重复纹理骗不过）
+        #   c) Hartley normalization 确保 DLT 数值稳定，H 不退化为单位阵
+        warp_fine_flat = warp_AB_fine.reshape(B, Hf * Wf, 2)
+        pos_A_fine = self._get_token_coords(B, Hf, Wf, device, dtype)
+
+        # 对应的 fine 特征（B, N_fine, C）
+        feat_A_fine_flat = feat_A_fine.flatten(2).transpose(1, 2)
+        feat_B_aligned_for_ransac = safe_grid_sample(feat_B_fine, warp_AB_fine, align_corners=False)
+        feat_B_fine_flat = feat_B_aligned_for_ransac.flatten(2).transpose(1, 2)
+
+        if H_prior is not None:
+            H_to_invert = H_prior
+        else:
+            inlier_weights = self.inlier_predictor(
+                pos_A_fine.detach(),
+                warp_fine_flat.detach(),
+                feat_A_fine_flat.float(),
+                feat_B_fine_flat.float(),
+            )
+
+            conf_fine_flat = confidence_AB_fine.reshape(B, Hf * Wf, 1).detach()
+            combined_weights = (inlier_weights * conf_fine_flat).squeeze(-1)
+
+            H_to_invert = solve_differentiable_dlt(
+                pos_A_fine.detach(),
+                warp_fine_flat.detach(),
+                combined_weights.unsqueeze(-1),
+            )
 
         return {
             # 匹配矩阵
@@ -552,6 +783,8 @@ class AgriMatcher(nn.Module):
             # 动态尺寸信息（供 Loss 使用）
             'coarse_hw': (Hc, Wc),
             'fine_hw': (Hf, Wf),
+            # H_base 现在来自 refine 后的精化 warp + 语义引导权重
+            'H_base': H_to_invert,
         }
 
     @staticmethod
@@ -638,78 +871,81 @@ class AgriTPSStitcher(nn.Module):
 
         B, H_feat, W_feat, _ = warp_AB.shape
         device = warp_AB.device
-        dtype = warp_AB.dtype  # 原始 dtype（AMP 下为 fp16），最终输出时恢复
+        dtype = warp_AB.dtype
 
-        # 提取真实图像的全分辨率
         H_img, W_img = img_A.shape[2], img_A.shape[3]
+        H_mat = m_out['H_base']
 
-        grid_A_feat = make_grid(B, H_feat, W_feat, device, torch.float32)
-        src_pts_feat = grid_A_feat.reshape(B, -1, 2)  # fp32
-        dst_pts_feat = warp_AB.reshape(B, -1, 2).float()  # fp32
-        weights_feat = conf_AB.reshape(B, -1, 1).float()  # fp32
-
-        H_mat = solve_weighted_affine(src_pts_feat, dst_pts_feat, weights_feat)
-
-        # 全分辨率单应性网格（fp32，避免 fp16 bmm 溢出产生 Inf/NaN）
-        grid_A_img = make_grid(B, H_img, W_img, device, torch.float32)  # fp32
+        grid_A_img = make_grid(B, H_img, W_img, device, torch.float32)
         src_pts_img = grid_A_img.reshape(B, -1, 2)
         ones_img = torch.ones(B, H_img * W_img, 1, device=device, dtype=torch.float32)
-        coords_homo_img = torch.cat([src_pts_img, ones_img], dim=-1)  # fp32
-        projected_homo = torch.bmm(coords_homo_img, H_mat.transpose(1, 2))  # fp32
+        coords_homo_img = torch.cat([src_pts_img, ones_img], dim=-1)
+        projected_homo = torch.bmm(coords_homo_img, H_mat.transpose(1, 2))
+        z_img = projected_homo[..., 2:3]
+        sign_img = z_img.sign()
+        sign_img = torch.where(sign_img == 0, torch.ones_like(sign_img), sign_img)
+        denom = torch.where(z_img.abs() < 1e-3, 1e-3 * sign_img, z_img)
 
-        # 透视除法：额外 clamp 防止 z≈0 或 z<0 时产生极大值
-        denom = projected_homo[..., 2:3].clamp(min=1e-3)  # ≥ 1e-3
-        base_grid = (projected_homo[..., :2] / denom).reshape(B, H_img, W_img, 2)
-        base_grid = base_grid.clamp(-3.0, 3.0)  # 正常透视变换不超出此范围
+        base_grid = (projected_homo[..., :2] / denom).reshape(B, H_img, W_img, 2).clamp(-3., 3.)
+
+        # warp_AB[b,i,j] = A位置(i,j)在B中的归一化坐标
+        # 用 warp_AB 采样 feat_B，得到 A 坐标系下对应的 B 特征
+        # padding_mode='zeros'：越界区域填0，FlowAggregator 可通过 coverage 图感知到这些区域
+        feat_B_aligned = F.grid_sample(
+            m_out['feat_B_64'],  # (B, C, Hf, Wf)，原始 B 特征图
+            warp_AB.to(m_out['feat_B_64'].dtype),  # (B, Hf, Wf, 2)，对齐坐标
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        )
 
         hc_wc = m_out.get('coarse_hw')
         tps_out = self.tps_estimator(
             warp_AB=warp_AB,
             confidence=conf_AB,
             feat_A=m_out['feat_A_64'],
-            feat_B=m_out['feat_B_64'],
+            feat_B=feat_B_aligned,
             sim_matrix=m_out['sim_matrix'],
             warp_AB_coarse=m_out['warp_AB_coarse'],
-            coarse_hw=hc_wc
+            coarse_hw=hc_wc,
         )
-        delta_cp_total = tps_out['delta_cp']  # [B, 2, gs, gs] 预测的总偏移
+        delta_cp_total = tps_out['delta_cp']
 
-        # 控制点投影：同样强制 fp32，与 H_mat 保持一致
-        y_cp = torch.linspace(-1.0 + 1.0 / self.gs, 1.0 - 1.0 / self.gs, self.gs, device=device, dtype=torch.float32)
-        x_cp = torch.linspace(-1.0 + 1.0 / self.gs, 1.0 - 1.0 / self.gs, self.gs, device=device, dtype=torch.float32)
+        y_cp = torch.linspace(-1. + 1. / self.gs, 1. - 1. / self.gs, self.gs, device=device, dtype=torch.float32)
+        x_cp = torch.linspace(-1. + 1. / self.gs, 1. - 1. / self.gs, self.gs, device=device, dtype=torch.float32)
         gy, gx = torch.meshgrid(y_cp, x_cp, indexing='ij')
-        p_src = torch.stack([gx, gy], dim=-1).reshape(1, -1, 2).expand(B, -1, -1)  # fp32
+        p_src = torch.stack([gx, gy], dim=-1).reshape(1, -1, 2).expand(B, -1, -1)
 
         ones_cp = torch.ones(B, self.gs * self.gs, 1, device=device, dtype=torch.float32)
-        p_src_homo_coords = torch.cat([p_src, ones_cp], dim=-1)  # fp32
-        p_homo_proj = torch.bmm(p_src_homo_coords, H_mat.transpose(1, 2))  # fp32
+        p_src_homo = torch.cat([p_src, ones_cp], dim=-1)
+        p_homo_proj = torch.bmm(p_src_homo, H_mat.transpose(1, 2))
+        z_cp = p_homo_proj[..., 2:3]
+        sign_cp = z_cp.sign()
+        sign_cp = torch.where(sign_cp == 0, torch.ones_like(sign_cp), sign_cp)
+        denom_cp = torch.where(z_cp.abs() < 1e-3, 1e-3 * sign_cp, z_cp)
 
-        # clamp 分母，防止 z≈0 导致极大值
-        denom_cp = p_homo_proj[..., 2:3].clamp(min=1e-3)
-        p_homo = (p_homo_proj[..., :2] / denom_cp).clamp(-10.0, 10.0)
+        p_homo = (p_homo_proj[..., :2] / denom_cp).clamp(-10., 10.)
 
         p_target_total = p_src + delta_cp_total.float().reshape(B, 2, -1).permute(0, 2, 1)
-        delta_cp_local = p_target_total - p_homo  # fp32 [B, N_cp, 2]
-
+        delta_cp_local = p_target_total - p_homo
         delta_cp_local_4d = delta_cp_local.permute(0, 2, 1).reshape(B, 2, self.gs, self.gs)
-        # grid_gen 内部强制 fp32，返回 fp32
-        tps_local_grid = self.grid_gen(delta_cp_local_4d, target_shape=(H_img, W_img))
-        tps_residual_flow = tps_local_grid - grid_A_img  # fp32 [B,H,W,2]
 
-        # 合并后转回原始 dtype，与 AMP 上下文兼容
-        final_grid = (base_grid + tps_residual_flow).to(dtype)
+        tps_local_grid = self.grid_gen(delta_cp_local_4d, target_shape=(H_img, W_img))
+        tps_residual_flow = tps_local_grid - grid_A_img
+        final_grid = base_grid + tps_residual_flow
 
         if self.training:
-            # 这里的折叠惩罚依然基于总的 delta_cp 计算，这能有效防止最终的网格发生拓扑反转
-            fold_info = self.tps_estimator.folding(delta_cp_total, final_grid)
+            fold_info = self.tps_estimator.folding(delta_cp_local_4d, final_grid)
             tps_out.update(fold_info)
 
         return {
             'dense_grid': final_grid,
+            'tps_residual_flow': tps_local_grid - base_grid,
+            'delta_cp_local': delta_cp_local_4d,
             'delta_cp': delta_cp_total,
             'matcher_out': m_out,
             'H_mat': H_mat,
-            'tps_out': tps_out
+            'tps_out': tps_out,
         }
 
 
@@ -746,8 +982,11 @@ class LocalGeometricConsistency(nn.Module):
         f_reshaped = f.reshape(B * 2, 1, H, W)
 
         # 只保留二阶惩罚，允许一阶透视形变
-        second_order = F.conv2d(f_reshaped, lap, padding=1).abs()
-        second_order = second_order.reshape(B, 2, H, W).mean(1, keepdim=True)  # [B, 1, H, W]
+        f_padded = F.pad(f_reshaped, (1, 1, 1, 1), mode='replicate')
+
+        # 卷积时不再 padding
+        second_order = F.conv2d(f_padded, lap, padding=0).abs()
+        second_order = second_order.reshape(B, 2, H, W).mean(1, keepdim=True)
 
         return (second_order * conf).mean()
 
@@ -782,10 +1021,26 @@ class DistillationLoss(nn.Module):
 
     @staticmethod
     def total_variation_loss(warp: torch.Tensor) -> torch.Tensor:
-        """TV 平滑损失"""
-        dx = torch.abs(warp[:, :, 1:, :] - warp[:, :, :-1, :])
-        dy = torch.abs(warp[:, 1:, :, :] - warp[:, :-1, :, :])
-        return dx.mean() + dy.mean()
+        """TV 平滑损失必须作用在位移残差上，防止绝对坐标坍缩"""
+        B, H, W, _ = warp.shape
+        device = warp.device
+
+        # 实时生成当前分辨率的归一化网格
+        xs = (torch.arange(W, device=device, dtype=warp.dtype) + 0.5) * (2.0 / W) - 1.0
+        ys = (torch.arange(H, device=device, dtype=warp.dtype) + 0.5) * (2.0 / H) - 1.0
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        identity_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
+
+        # 求出真实的形变偏移量 (Flow)
+        flow = warp - identity_grid
+
+        # 在偏移量上惩罚突变 (二阶差分/Laplacian TV)
+        # flow shape is (B, H, W, 2).
+        # dim 1 is H (y-axis), dim 2 is W (x-axis)
+        dx2 = torch.abs(flow[:, :, 2:, :] - 2 * flow[:, :, 1:-1, :] + flow[:, :, :-2, :])
+        dy2 = torch.abs(flow[:, 2:, :, :] - 2 * flow[:, 1:-1, :, :] + flow[:, :-2, :, :])
+
+        return dx2.mean() + dy2.mean()
 
     @staticmethod
     def _weighted_huber(
@@ -939,11 +1194,9 @@ class DistillationLoss(nn.Module):
 
         conf_mean = teacher_conf_c.mean(dim=(1, 2), keepdim=True).clamp(min=0.1)
         teacher_conf_c_normalized = (teacher_conf_c / conf_mean).clamp(0, 2.0)
-        
+
         loss_warp_coarse = self._weighted_huber(warp_coarse, teacher_warp_c, teacher_conf_c_normalized)
         loss_warp_refine = self._weighted_huber(warp_refine, teacher_warp_r, teacher_conf_r)
-        
-        
 
         # KL 损失
         sim_matrix = stu_output.get("sim_matrix_kl")
