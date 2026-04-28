@@ -137,8 +137,13 @@ class ConfidenceWeightedVotingDynamic(nn.Module):
         flow_coords = self._get_flow_pixel_coords(H, W, device, dtype)
 
         # flow = 目标坐标 - 源坐标（位移向量）
-        flow      = warp_AB.reshape(B, N_flow, 2) - flow_coords.unsqueeze(0)  # (B,N_f,2)
-        conf_flat = confidence.reshape(B, N_flow)                               # (B,N_f)
+        flow = torch.nan_to_num(
+            warp_AB.reshape(B, N_flow, 2) - flow_coords.unsqueeze(0),
+            nan=0.0, posinf=2.0, neginf=-2.0,
+        )  # (B,N_f,2)
+        conf_flat = torch.nan_to_num(
+            confidence.reshape(B, N_flow), nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp_(0.0, 1.0)  # (B,N_f)
 
         # 置信度调制核：w[b,i,k] = conf[b,i] * kernel[i,k]
         w   = conf_flat.unsqueeze(2) * kernel.unsqueeze(0)   # (B,N_f,N_cp)
@@ -146,15 +151,18 @@ class ConfidenceWeightedVotingDynamic(nn.Module):
 
         weight_sum    = w_t.sum(-1, keepdim=True)             # (B,N_cp,1)
         delta_cp_flat = torch.bmm(w_t, flow) / (weight_sum + self.min_weight_sum)
+        delta_cp_flat = torch.nan_to_num(delta_cp_flat, nan=0.0, posinf=2.0, neginf=-2.0)
         # (B,N_cp,2)
 
         # 覆盖度图
         gs = self.grid_size
         coverage = weight_sum.squeeze(-1).reshape(B, gs, gs)
         coverage = coverage / (coverage.amax(dim=(1, 2), keepdim=True) + 1e-6)
+        coverage = torch.nan_to_num(coverage, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
 
         # (B,N_cp,2) → (B,2,gs,gs)
         delta_cp = delta_cp_flat.reshape(B, gs, gs, 2).permute(0, 3, 1, 2).contiguous()
+        delta_cp = torch.nan_to_num(delta_cp, nan=0.0, posinf=2.0, neginf=-2.0).clamp(-2.0, 2.0)
 
         return delta_cp, coverage
 
@@ -216,7 +224,7 @@ class CoarseFineConsistency(nn.Module):
             size=(Hf, Wf), mode="bilinear", align_corners=False,
         ).permute(0, 2, 3, 1)
 
-        diff        = (warp_fine - warp_coarse_up).norm(dim=-1, keepdim=True)
+        diff = ((warp_fine - warp_coarse_up) ** 2).sum(dim=-1, keepdim=True).clamp(min=1e-12).sqrt()
         consistency = torch.exp(-diff / self.tau).permute(0, 3, 1, 2)  # (B,1,Hf,Wf)
         return consistency.detach()
 
@@ -273,7 +281,7 @@ class FlowAggregator(nn.Module):
             nn.Conv2d(hidden_ch // 2, 1, 1),
             nn.Sigmoid(),
         )
-        nn.init.constant_(self.gate_head[-2].bias, 2.0)  # sigmoid(2) ≈ 0.88
+        nn.init.constant_(self.gate_head[-2].bias, +2.0)
 
         # 残差头：预测学习到的偏移量
         # 初始化为0，确保训练初期输出 = 投票结果（稳定起点）
@@ -300,7 +308,6 @@ class FlowAggregator(nn.Module):
         """
         # 特征一致性（额外的1通道监督信号，通过consistency_head计算）
         # 注意：consistency已在BypassTPSEstimator中计算并concat进feat_in
-        # 这里直接用feat_in编码即可
 
         encoded    = self.encoder(feat_in)             # (B, hid, ~H/4, ~W/4)
         encoded_gs = self.adapt_pool(encoded)          # (B, hid, gs, gs)
@@ -331,6 +338,7 @@ class _FoldingPenaltyCP(nn.Module):
 
     def forward(self, delta_cp: torch.Tensor) -> torch.Tensor:
         """delta_cp: (B, 2, gs, gs) → fold_loss: scalar"""
+        delta_cp = torch.nan_to_num(delta_cp, nan=0.0, posinf=2.0, neginf=-2.0).clamp(-2.0, 2.0)
         gs = self.grid_size
         y_cp = torch.linspace(-1.0 + 1.0 / gs, 1.0 - 1.0 / gs, gs, device=delta_cp.device, dtype=delta_cp.dtype)
         x_cp = torch.linspace(-1.0 + 1.0 / gs, 1.0 - 1.0 / gs, gs, device=delta_cp.device, dtype=delta_cp.dtype)
@@ -347,6 +355,8 @@ class _FoldingPenaltyCP(nn.Module):
         dydu = (ty[:, :, 1:] - ty[:, :, :-1])[:, :-1, :]   # (B,gs-1,gs-1)
 
         det_J = dxdu * dydv - dxdv * dydu
+        det_J = torch.nan_to_num(det_J, nan=0.0, posinf=10.0, neginf=-10.0)
+
         return F.relu(-det_J + self.epsilon).mean()
 
 
@@ -356,7 +366,7 @@ class FoldingPenaltyDense(nn.Module):
 
     优势：能检测TPS插值引入的"控制点之间的折叠"，
     比控制点层面更准确但计算量更大。
-    通过 stride 下采样控制计算量。
+    通过双线性插值缩放到固定 target_eval_size 控制计算量，差分步长在多尺度训练下恒定。
 
     注意：此处使用归一化雅可比（除以像素间距）以实现尺度不变性。
     """
@@ -372,18 +382,19 @@ class FoldingPenaltyDense(nn.Module):
     def forward(
             self, dense_field: torch.Tensor,  # (B, H, W, 2)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        field = dense_field.permute(0, 3, 1, 2)  # (B, 2, H, W)
-        B, _, H, W = field.shape
+        field = torch.nan_to_num(
+            dense_field.permute(0, 3, 1, 2), nan=0.0, posinf=3.0, neginf=-3.0
+        ).clamp(-3.0, 3.0)  # (B, 2, H, W)
 
-        # 动态计算 stride，确保下采样后的宽/高大约等于 target_eval_size
-        stride_h = max(1, H // self.target_eval_size)
-        stride_w = max(1, W // self.target_eval_size)
-
-        # 动态下采样
-        field_s = field[:, :, ::stride_h, ::stride_w]  # (B, 2, Hs, Ws)
+        field_s = F.interpolate(
+            field,
+            size=(self.target_eval_size, self.target_eval_size),
+            mode="bilinear",
+            align_corners=False,
+        )  # (B, 2, target_eval_size, target_eval_size)
         Hs, Ws = field_s.shape[2:]
 
-        # 归一化坐标系下的像素间距 (考虑了动态下采样的跨度)
+        # 归一化坐标系下的像素间距（固定评估网格）
         du = 2.0 / max(Ws - 1, 1)
         dv = 2.0 / max(Hs - 1, 1)
 
@@ -396,6 +407,7 @@ class FoldingPenaltyDense(nn.Module):
         # 取公共区域 (Hs-1, Ws-1)
         det_J = dx_du[:, :-1, :] * dy_dv[:, :, :-1] \
                 - dx_dv[:, :, :-1] * dy_du[:, :-1, :]  # (B,Hs-1,Ws-1)
+        det_J = torch.nan_to_num(det_J, nan=0.0, posinf=10.0, neginf=-10.0)
 
         fold_loss = F.relu(-det_J + self.epsilon).mean()
         fold_mask = (det_J < 0).detach()
@@ -410,7 +422,7 @@ class FoldingPenaltyDense(nn.Module):
 class CombinedFoldingPenalty(nn.Module):
     """
     组合折叠惩罚：控制点层面 + 密集场层面。
-    支持外部调度 lambda_cp / lambda_dense（训练脚本按epoch调整）。
+    支持外部调度 lambda_cp / lambda_dense。
     """
 
     def __init__(
@@ -454,7 +466,7 @@ class CombinedFoldingPenalty(nn.Module):
         }
 
 
-class BypassTPSEstimator(nn.Module):
+class TPSEstimator(nn.Module):
     """
     Bypass Global Homography TPS 估计器。
 
@@ -526,18 +538,22 @@ class BypassTPSEstimator(nn.Module):
         coarse_hw: Optional[Tuple[int, int]] = None
     ) -> Dict[str, torch.Tensor]:
         if self.training:
-            warp_AB = warp_AB.detach()
-            confidence = confidence.detach()
+            warp_for_voter = warp_AB
+            conf_for_voter = confidence.detach()
+            # feat_A/B 保留梯度：允许 Aggregator 从特征一致性中学习
             feat_A = feat_A
             feat_B = feat_B
-
+        else:
+            warp_for_voter = warp_AB
+            conf_for_voter = confidence
         B, H, W, _ = warp_AB.shape
         device, dtype = warp_AB.device, warp_AB.dtype
 
         # 物理投票初始解
-        delta_cp_init, coverage = self.voter(warp_AB, confidence)
+        delta_cp_init, coverage = self.voter(warp_for_voter, conf_for_voter)
         # delta_cp_init: (B,2,gs,gs)  coverage: (B,gs,gs)
-
+        coverage_cp = coverage
+        coverage_gate = coverage_cp.unsqueeze(1)
         # 构建输入特征
         # flow 向量
         y_f = torch.linspace(-1.+1./H, 1.-1./H, H, device=device, dtype=dtype)
@@ -598,7 +614,7 @@ class BypassTPSEstimator(nn.Module):
 
         # FlowAggregator
         delta_cp, gate = self.aggregator(feat_in, delta_cp_init, feat_A, feat_B)
-
+        delta_cp = delta_cp * coverage_gate
         if self.training and dense_field is not None:
             fold_out = self.folding(delta_cp, dense_field)
         else:
@@ -665,36 +681,35 @@ class TPSGridGenerator(nn.Module):
     def forward(self, delta_cp: torch.Tensor, target_shape: Tuple[int, int]) -> torch.Tensor:
         B = delta_cp.shape[0]
         H, W = target_shape
-        device, dtype = delta_cp.device, delta_cp.dtype
+        out_dtype = delta_cp.dtype
+        device = delta_cp.device
 
-        # 缓存静态几何矩阵 (K_pix, P_pix)
-        key = (H, W, str(device), str(dtype))
-        if key not in self._cache:
-            ys = (torch.arange(H, device=device, dtype=dtype) + 0.5) * (2.0 / H) - 1.0
-            xs = (torch.arange(W, device=device, dtype=dtype) + 0.5) * (2.0 / W) - 1.0
-            yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+        with torch.amp.autocast("cuda", enabled=False):
+            p_src = self.p_src.to(device=device, dtype=torch.float32)
+            L_inv = self.L_inv.to(device=device, dtype=torch.float32)
 
+            p_delta = torch.nan_to_num(
+                delta_cp.permute(0, 2, 3, 1).reshape(delta_cp.shape[0], -1, 2).float(),
+                nan=0.0, posinf=2.0, neginf=-2.0,
+            ).clamp(-2.0, 2.0)
+            p_tgt_cp = p_src.unsqueeze(0) + p_delta
+            Y = torch.cat(
+                [p_tgt_cp, torch.zeros(delta_cp.shape[0], 3, 2, device=device, dtype=torch.float32)],
+                dim=1,
+            )
+            coeffs = torch.matmul(L_inv, Y)
+            coeffs = torch.nan_to_num(coeffs, nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
+
+            ys = (torch.arange(H, device=device, dtype=torch.float32) + 0.5) * (2.0 / H) - 1.0
+            xs = (torch.arange(W, device=device, dtype=torch.float32) + 0.5) * (2.0 / W) - 1.0
+            yy, xx = torch.meshgrid(ys, xs, indexing="ij")
             p_tgt_pix = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1)
-            dist_pix_cp = torch.cdist(p_tgt_pix, self.p_src)
 
+            dist_pix_cp = torch.cdist(p_tgt_pix, p_src)
             K_pix = self._tps_kernel(dist_pix_cp)
-            P_pix = torch.cat([torch.ones(H * W, 1, device=device, dtype=dtype), p_tgt_pix], dim=1)
-            self._cache[key] = (K_pix.detach(), P_pix.detach())
+            P_pix = torch.cat([torch.ones(H * W, 1, device=device), p_tgt_pix], dim=1)
+            grid = torch.matmul(K_pix, coeffs[:, :self.gs ** 2]) + torch.matmul(P_pix, coeffs[:, self.gs ** 2:])
+            grid = torch.nan_to_num(grid, nan=0.0, posinf=3.0, neginf=-3.0).clamp(-3.0, 3.0)
 
-        K_pix, P_pix = self._cache[key]
+        return grid.reshape(delta_cp.shape[0], H, W, 2).to(out_dtype)
 
-        # 动态计算 TPS 系数 (每个 batch 都运行，强制 FP32 保证形变精度)
-        with torch.amp.autocast('cuda', enabled=False):
-            # 将 delta_cp 从 (B,2,gs,gs) 转为 (B,N_cp,2)
-            p_delta = delta_cp.permute(0, 2, 3, 1).reshape(B, -1, 2).float()
-            p_tgt_cp = self.p_src.unsqueeze(0) + p_delta
-
-            # 求解 L_inv * Y = coeffs
-            Y = torch.cat([p_tgt_cp, torch.zeros(B, 3, 2, device=device)], dim=1)
-            coeffs = torch.matmul(self.L_inv, Y)  # [B, gs^2+3, 2]
-
-            # 映射网格
-            grid = torch.matmul(K_pix, coeffs[:, :self.gs ** 2, :]) + \
-                   torch.matmul(P_pix, coeffs[:, self.gs ** 2:, :])
-
-        return grid.reshape(B, H, W, 2).to(dtype)

@@ -4,100 +4,160 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dense_match.network import AgriTPSStitcher
+from dense_match.network import AgriStitcher
 
 STAGE_DEFS = [
-    # 目标：让 Matcher + WarpRefiner 在纯监督信号下收敛，
-    #       Aggregator 冻结，保证"投票初始解"质量。
+    # STAGE 1: 基础对齐与内点识别 (Epoch 1-20)
+    # 目标：Aggregator 冻结。让 Matcher 学会特征匹配，
+    #       同时让 inlier_predictor 学会区分真假匹配。
     {
         "name": "SUPERVISED_WARMUP",
         "epoch_start": 1,
         "epoch_end": 20,
-        "freeze": ["aggregator"],          # backbone + matcher 可训练
-        "unfreeze_backbone": True,         # backbone 以低 LR 微调
+        "freeze": ["stitch_decoder"],
+        "use_inlier_predictor": True,
+        "unfreeze_backbone": True,
         "scheduler": "onecycle",
         "max_lr": {
-            "backbone": 2e-5,              # 预训练权重，极小 LR 保护
-            "matcher":  2e-4,
-            "aggregator": 0.0,             # 冻结，不放入优化器
+            "backbone": 2e-5,
+            "matcher": 2e-4,
+            "stitch_decoder": 0.0,
+            "inlier_predictor": 1e-4,
         },
-        # 固定权重（不插值）
-        "loss_weights": {
+        "loss_weights_start": {
             "distill": 1.0,
-            "fold":    0.1,   # fold 权重保守：此阶段 Aggregator 冻结，fold_loss 来自投票初始解
-            "photo":   0.0,   # 关键：Stage 1 禁止 photo_loss
-            "ssim":    0.0,
-            "cycle":   0.0,
-            "geo":     0.15,
-            "tps_smooth": 0.1,
+            "photo": 0.0,
+            "ssim": 0.0,
+            "cycle": 0.0,
+            "geo": 0.15,
+            "h_distill": 0.03,
+            "h_match": 0.01,
+            "h_residual_budget": 0.0,
+            "residual_distill": 0.0,
+            "stitch_residual": 0.0,
+            "stitch_mask": 0.0,
+            "stitch_mask_target": 0.03,
+            "area_penalty": 0.0,
+            "inlier": 1.0,
+        },
+        "loss_weights_end": {
+            "distill": 1.0,
+            "photo": 0.0,
+            "ssim": 0.0,
+            "cycle": 0.0,
+            "geo": 0.15,
+            "h_distill": 0.05,
+            "h_match": 0.02,
+            "h_residual_budget": 0.0,
+            "residual_distill": 0.0,
+            "stitch_residual": 0.0,
+            "stitch_mask": 0.0,
+            "stitch_mask_target": 0.03,
+            "area_penalty": 0.0,
+            "inlier": 1.0,
         },
     },
-    # 目标：Aggregator 从一张"白纸"开始学习，
-    #       用 OneCycleLR 给它足够能量，photo_loss 缓慢升温。
+
+    # STAGE 2: 变形场激活与光度蒸馏 (Epoch 21-40)
+    # 目标：Aggregator 解冻，开始从学习。
+    #       利用已经学好的 H 矩阵，配合逐渐升温的 Photo Loss 寻找最优解。
     {
-        "name": "AGGREGATOR_ACTIVATION",
+        "name": "STITCH_DECODER_ACTIVATION",
         "epoch_start": 21,
         "epoch_end": 40,
-        "freeze": [],                       # 全部解冻
-        "unfreeze_backbone": False,         # backbone 保持冻结状态（避免大幅震荡）
+        "freeze": [],  # 全部解冻
+        "use_inlier_predictor": True,
+        "unfreeze_backbone": False,
         "scheduler": "onecycle",
-        # 注意：backbone 此阶段冻结（requires_grad=False），不放入优化器
         "max_lr": {
-            "backbone":   0.0,             # 冻结
-            "matcher":    5e-5,            # Matcher 已有梯度历史，低 LR 精调
-            "aggregator": 2e-4,            # Aggregator 新生，给够能量
+            "backbone": 0.0,
+            "matcher": 5e-5,
+            "stitch_decoder": 2e-4,
+            "inlier_predictor": 3e-5,
         },
         # 阶段内线性插值
         "loss_weights_start": {
             "distill": 0.8,
-            "fold":    0.3,
-            "photo":   0.0,
-            "ssim":    0.0,
-            "cycle":   0.0,
-            "geo":     0.15,
-            "tps_smooth": 0.3,
+            "photo": 0.0,
+            "ssim": 0.0,
+            "cycle": 0.0,
+            "geo": 0.15,
+            "h_distill": 0.08,
+            "h_match": 0.03,
+            "h_residual_budget": 0.02,
+            "residual_distill": 0.02,
+            "stitch_residual": 0.15,
+            "stitch_mask": 0.05,
+            "stitch_mask_target": 0.04,
+            "area_penalty": 0.0,
+            "inlier": 0.5,
         },
         "loss_weights_end": {
             "distill": 0.5,
-            "fold":    0.5,
-            "photo":   0.8,   # 20 个 Epoch 后到 0.8
-            "ssim":    0.0,
-            "cycle":   0.0,
-            "geo":     0.1,
-            "tps_smooth": 0.5,
+            "photo": 0.25,
+            "ssim": 0.0,
+            "cycle": 0.0,
+            "geo": 0.1,
+            "h_distill": 0.05,
+            "h_match": 0.02,
+            "h_residual_budget": 0.08,
+            "residual_distill": 0.08,
+            "stitch_residual": 0.1,
+            "stitch_mask": 0.05,
+            "stitch_mask_target": 0.08,
+            "area_penalty": 0.25,
+            "inlier": 0.3,
         },
     },
-    # 目标：全网络端到端精调，引入 SSIM 和（可选）Cycle Loss，
-    #       Backbone 以极小 LR 解冻，Cosine 缓慢收敛。
+
+    # STAGE 3: 全网络端到端收敛 (Epoch 41-80)
+    # 目标：解冻所有模块，引入极小 LR 和余弦退火。
+    #       开启感知级 Loss (SSIM, Cycle) 进行像素级打磨。
     {
         "name": "END_TO_END_FINETUNE",
         "epoch_start": 41,
-        "epoch_end": 80,      # 可通过 --epochs 覆盖
+        "epoch_end": 80,
         "freeze": [],
+        "use_inlier_predictor": True,
         "unfreeze_backbone": True,
         "scheduler": "cosine",
         "max_lr": {
-            "backbone":   5e-6,   # 非常保守，只让预训练权重微调
-            "matcher":    2e-5,
-            "aggregator": 5e-5,
+            "backbone": 5e-6,  # 极微弱地调优骨干网络
+            "matcher": 2e-5,
+            "stitch_decoder": 5e-5,
+            "inlier_predictor": 1e-5,
         },
         "loss_weights_start": {
             "distill": 0.4,
-            "fold":    0.5,
-            "photo":   0.8,
-            "ssim":    0.0,   # SSIM 从 0 开始，前 10 个 Epoch 内线性升温
-            "cycle":   0.0,
-            "geo":     0.08,
-            "tps_smooth": 0.2,
+            "photo": 0.25,
+            "ssim": 0.0,
+            "cycle": 0.05,
+            "geo": 0.08,
+            "h_distill": 0.04,
+            "h_match": 0.015,
+            "h_residual_budget": 0.08,
+            "residual_distill": 0.06,
+            "stitch_residual": 0.1,
+            "stitch_mask": 0.05,
+            "stitch_mask_target": 0.08,
+            "area_penalty": 0.25,
+            "inlier": 0.2,
         },
         "loss_weights_end": {
-            "distill": 0.3,
-            "fold":    0.4,
-            "photo":   0.6,
-            "ssim":    0.3,
-            "cycle":   0.0,   # Cycle Loss 风险较高，默认关闭；如需开启，从 0.1 起
-            "geo":     0.05,
-            "tps_smooth": 0.1,
+            "distill": 0.2,
+            "photo": 0.45,
+            "ssim": 0.3,
+            "cycle": 0.1,
+            "geo": 0.05,
+            "h_distill": 0.02,
+            "h_match": 0.01,
+            "h_residual_budget": 0.06,
+            "residual_distill": 0.04,
+            "stitch_residual": 0.05,
+            "stitch_mask": 0.03,
+            "stitch_mask_target": 0.10,
+            "area_penalty": 0.5,
+            "inlier": 0.1,
         },
     },
 ]
@@ -112,13 +172,17 @@ def get_stage(epoch: int) -> Dict:
 
 
 def interpolate_loss_weights(stage: Dict, epoch: int) -> Dict[str, float]:
-    """在阶段内对 Loss 权重做线性插值，消除阶跃跳变"""
+    """
+    在阶段内对 Loss 权重做线性插值。
+    """
     if "loss_weights" in stage:
         return dict(stage["loss_weights"])
 
     e_start = stage["epoch_start"]
     e_end = stage["epoch_end"]
-    t = (epoch - e_start) / max(e_end - e_start, 1)
+    span = max(e_end - e_start, 1)
+
+    t = (epoch - e_start + 0.5) / span
     t = float(max(0.0, min(1.0, t)))
 
     ws = stage["loss_weights_start"]
@@ -127,7 +191,7 @@ def interpolate_loss_weights(stage: Dict, epoch: int) -> Dict[str, float]:
 
 
 
-def _get_module_param_groups(model: AgriTPSStitcher, max_lr: Dict[str, float]) -> List[Dict]:
+def _get_module_param_groups(model: AgriStitcher, max_lr: Dict[str, float]) -> List[Dict]:
     """
     按子模块分组参数，支持每组独立 LR。
     只把 lr > 0 的组放入优化器（冻结模块不产生梯度，放入也无意义且浪费内存）。
@@ -142,59 +206,64 @@ def _get_module_param_groups(model: AgriTPSStitcher, max_lr: Dict[str, float]) -
             "name": "matcher",
             "params": [
                 p for n, p in model.matcher.named_parameters()
-                if "backbone" not in n
+                if "backbone" not in n and "inlier_predictor" not in n
             ],
             "lr": max_lr.get("matcher", 2e-4),
         },
         {
-            "name": "aggregator",
-            "params": list(model.tps_estimator.parameters()),
-            "lr": max_lr.get("aggregator", 2e-4),
+            "name": "inlier_predictor",
+            "params": list(model.matcher.inlier_predictor.parameters()),
+            "lr": max_lr.get("inlier_predictor", 0.0),
+        },
+        {
+            "name": "stitch_decoder",
+            "params": list(model.stitch_decoder.parameters()),
+            "lr": max_lr.get("stitch_decoder", 2e-4),
         },
     ]
     return groups
 
 
-def apply_freeze_state(model: AgriTPSStitcher, stage: Dict) -> None:
-    """
-    按阶段配置冻结/解冻模块。
-    冻结时同时调用 .eval()，防止 BatchNorm / LayerNorm 统计量被小 batch 破坏。
-    """
+def apply_freeze_state(model: AgriStitcher, stage: Dict) -> None:
     frozen = set(stage.get("freeze", []))
+    stitch_decoder_key = "stitch_decoder"
     unfreeze_backbone = stage.get("unfreeze_backbone", True)
+    use_inlier_predictor = stage.get("use_inlier_predictor", False)
 
-    # Backbone
+    model.matcher.use_inlier_predictor = use_inlier_predictor
+
     backbone_frozen = "backbone" in frozen or not unfreeze_backbone
     for p in model.matcher.backbone.parameters():
         p.requires_grad = not backbone_frozen
     if backbone_frozen:
         model.matcher.backbone.eval()
 
-    # Matcher（不含 backbone）
+    inlier_frozen = ("inlier_predictor" in frozen) or not use_inlier_predictor
+    for p in model.matcher.inlier_predictor.parameters():
+        p.requires_grad = not inlier_frozen
+    if inlier_frozen:
+        model.matcher.inlier_predictor.eval()
+
     matcher_frozen = "matcher" in frozen
     for n, p in model.matcher.named_parameters():
-        if "backbone" not in n:
+        if "backbone" not in n and "inlier_predictor" not in n:
             p.requires_grad = not matcher_frozen
 
-    # Aggregator（BypassTPSEstimator）
-    aggregator_frozen = "aggregator" in frozen
-    for p in model.tps_estimator.parameters():
-        p.requires_grad = not aggregator_frozen
-    if aggregator_frozen:
-        model.tps_estimator.eval()
+    stitch_decoder_frozen = stitch_decoder_key in frozen
+    for p in model.stitch_decoder.parameters():
+        p.requires_grad = not stitch_decoder_frozen
+    if stitch_decoder_frozen:
+        model.stitch_decoder.eval()
 
-    frozen_names = []
-    if backbone_frozen:
-        frozen_names.append("backbone")
-    if matcher_frozen:
-        frozen_names.append("matcher")
-    if aggregator_frozen:
-        frozen_names.append("aggregator")
+    frozen_names = [n for n, flag in [
+        ("backbone", backbone_frozen), ("inlier_predictor", inlier_frozen),
+        ("matcher", matcher_frozen), ("stitch_decoder", stitch_decoder_frozen)
+    ] if flag]
     print(f"[Freeze] Frozen: {frozen_names or 'none'}")
 
 
 def build_optimizer_and_scheduler(
-    model: AgriTPSStitcher,
+    model: AgriStitcher,
     stage: Dict,
     steps_per_epoch: int,
     weight_decay: float = 1e-4,
@@ -230,18 +299,12 @@ def build_optimizer_and_scheduler(
 
     return optimizer, scheduler
 
+
 def update_optimizer_and_scheduler(
-    model: AgriTPSStitcher, stage: Dict, steps_per_epoch: int,
-    weight_decay: float = 1e-4, optimizer: Optional[torch.optim.Optimizer] = None
-) -> Tuple[torch.optim.Optimizer, Any]:
-
+        model, stage, steps_per_epoch, weight_decay=1e-4, optimizer=None
+):
     param_groups_cfg = _get_module_param_groups(model, stage["max_lr"])
-
-    if optimizer is None:
-        optimizer = torch.optim.AdamW(param_groups_cfg, weight_decay=weight_decay)
-    else:
-        for g, cfg in zip(optimizer.param_groups, param_groups_cfg):
-            g['lr'] = cfg['lr']
+    optimizer = torch.optim.AdamW(param_groups_cfg, weight_decay=weight_decay)
 
     total_steps = (stage["epoch_end"] - stage["epoch_start"] + 1) * steps_per_epoch
     if stage["scheduler"] == "onecycle":
@@ -249,19 +312,15 @@ def update_optimizer_and_scheduler(
             optimizer,
             max_lr=[g["lr"] for g in param_groups_cfg],
             total_steps=total_steps,
-            pct_start=0.25,  # 前 25% warmup
+            pct_start=0.25,
             anneal_strategy="cos",
-            div_factor=10,  # 起始 LR = max_lr / 10
-            final_div_factor=500,  # 结束 LR = max_lr / 5000（比较温柔的结尾）
+            div_factor=10,
+            final_div_factor=500,
         )
     elif stage["scheduler"] == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=total_steps,
-            eta_min=1e-8,
+            optimizer, T_max=total_steps, eta_min=1e-8,
         )
-    else:
-        raise ValueError(f"Unknown scheduler: {stage['scheduler']}")
     return optimizer, scheduler
 
 
