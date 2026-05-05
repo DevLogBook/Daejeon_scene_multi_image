@@ -7,13 +7,13 @@ import torch.nn.functional as F
 from dense_match.network import AgriStitcher
 
 STAGE_DEFS = [
-    # STAGE 1: 基础对齐与内点识别 (Epoch 1-20)
-    # 目标：Aggregator 冻结。让 Matcher 学会特征匹配，
-    #       同时让 inlier_predictor 学会区分真假匹配。
+    # STAGE 1: supervised warm-up for base alignment and inlier prediction.
+    # The stitch decoder is frozen so the matcher and inlier head learn a stable
+    # global correspondence model before dense residual deformation is enabled.
     {
         "name": "SUPERVISED_WARMUP",
         "epoch_start": 1,
-        "epoch_end": 20,
+        "epoch_end": 12,
         "freeze": ["stitch_decoder"],
         "use_inlier_predictor": True,
         "unfreeze_backbone": True,
@@ -38,7 +38,15 @@ STAGE_DEFS = [
             "stitch_mask": 0.0,
             "stitch_mask_target": 0.03,
             "area_penalty": 0.0,
-            "inlier": 1.0,
+            "fold": 0.0,
+            "photo_conf_threshold": 0.0,
+            "inlier_sigma_teacher": 0.04,
+            "inlier_sigma_h": 0.06,
+            "inlier_conf_thresh": 0.5,
+            "inlier_coverage": 0.03,
+            "inlier_coverage_bins": 4,
+            "inlier_coverage_min_mass": 0.03,
+            "inlier": 0.5,
         },
         "loss_weights_end": {
             "distill": 1.0,
@@ -54,18 +62,26 @@ STAGE_DEFS = [
             "stitch_mask": 0.0,
             "stitch_mask_target": 0.03,
             "area_penalty": 0.0,
-            "inlier": 1.0,
+            "fold": 0.0,
+            "photo_conf_threshold": 0.0,
+            "inlier_sigma_teacher": 0.04,
+            "inlier_sigma_h": 0.06,
+            "inlier_conf_thresh": 0.5,
+            "inlier_coverage": 0.03,
+            "inlier_coverage_bins": 4,
+            "inlier_coverage_min_mass": 0.03,
+            "inlier": 0.4,
         },
     },
 
-    # STAGE 2: 变形场激活与光度蒸馏 (Epoch 21-40)
-    # 目标：Aggregator 解冻，开始从学习。
-    #       利用已经学好的 H 矩阵，配合逐渐升温的 Photo Loss 寻找最优解。
+    # STAGE 2: activate the residual decoder with conservative photometric terms.
+    # The H path remains supervised while the mesh/dense residual learns only the
+    # part of the warp that the global transform cannot explain.
     {
         "name": "STITCH_DECODER_ACTIVATION",
-        "epoch_start": 21,
-        "epoch_end": 40,
-        "freeze": [],  # 全部解冻
+        "epoch_start": 13,
+        "epoch_end": 20,
+        "freeze": [],  # Unfreeze all trainable modules selected by learning rate.
         "use_inlier_predictor": True,
         "unfreeze_backbone": False,
         "scheduler": "onecycle",
@@ -75,73 +91,97 @@ STAGE_DEFS = [
             "stitch_decoder": 2e-4,
             "inlier_predictor": 3e-5,
         },
-        # 阶段内线性插值
+        # Linearly interpolate loss weights within the stage.
         "loss_weights_start": {
             "distill": 0.8,
             "photo": 0.0,
             "ssim": 0.0,
             "cycle": 0.0,
             "geo": 0.15,
-            "h_distill": 0.08,
-            "h_match": 0.03,
+            "h_distill": 0.04,
+            "h_match": 0.015,
             "h_residual_budget": 0.02,
-            "residual_distill": 0.02,
+            "residual_distill": 0.0,
             "stitch_residual": 0.15,
             "stitch_mask": 0.05,
             "stitch_mask_target": 0.04,
             "area_penalty": 0.0,
-            "inlier": 0.5,
+            "fold": 0.01,
+            "photo_conf_threshold": 0.4,
+            "inlier_sigma_teacher": 0.04,
+            "inlier_sigma_h": 0.06,
+            "inlier_conf_thresh": 0.5,
+            "inlier_coverage": 0.02,
+            "inlier_coverage_bins": 4,
+            "inlier_coverage_min_mass": 0.03,
+            "inlier": 0.3,
         },
         "loss_weights_end": {
             "distill": 0.5,
-            "photo": 0.25,
+            "photo": 0.08,
             "ssim": 0.0,
             "cycle": 0.0,
             "geo": 0.1,
-            "h_distill": 0.05,
-            "h_match": 0.02,
+            "h_distill": 0.02,
+            "h_match": 0.005,
             "h_residual_budget": 0.08,
-            "residual_distill": 0.08,
+            "residual_distill": 0.02,
             "stitch_residual": 0.1,
             "stitch_mask": 0.05,
             "stitch_mask_target": 0.08,
-            "area_penalty": 0.25,
-            "inlier": 0.3,
+            "area_penalty": 0.0,
+            "fold": 0.02,
+            "photo_conf_threshold": 0.4,
+            "inlier_sigma_teacher": 0.04,
+            "inlier_sigma_h": 0.06,
+            "inlier_conf_thresh": 0.5,
+            "inlier_coverage": 0.02,
+            "inlier_coverage_bins": 4,
+            "inlier_coverage_min_mass": 0.03,
+            "inlier": 0.2,
         },
     },
 
-    # STAGE 3: 全网络端到端收敛 (Epoch 41-80)
-    # 目标：解冻所有模块，引入极小 LR 和余弦退火。
-    #       开启感知级 Loss (SSIM, Cycle) 进行像素级打磨。
+    # STAGE 3: end-to-end fine-tuning with small learning rates and cosine decay.
+    # Photometric and perceptual terms are increased only after the geometry has
+    # become stable enough to avoid residual-field collapse.
     {
         "name": "END_TO_END_FINETUNE",
-        "epoch_start": 41,
+        "epoch_start": 21,
         "epoch_end": 80,
         "freeze": [],
         "use_inlier_predictor": True,
         "unfreeze_backbone": True,
         "scheduler": "cosine",
         "max_lr": {
-            "backbone": 5e-6,  # 极微弱地调优骨干网络
+            "backbone": 5e-6,  # Very small LR for backbone fine-tuning.
             "matcher": 2e-5,
             "stitch_decoder": 5e-5,
             "inlier_predictor": 1e-5,
         },
         "loss_weights_start": {
             "distill": 0.4,
-            "photo": 0.25,
+            "photo": 0.08,
             "ssim": 0.0,
             "cycle": 0.05,
             "geo": 0.08,
-            "h_distill": 0.04,
-            "h_match": 0.015,
+            "h_distill": 0.02,
+            "h_match": 0.005,
             "h_residual_budget": 0.08,
-            "residual_distill": 0.06,
+            "residual_distill": 0.02,
             "stitch_residual": 0.1,
             "stitch_mask": 0.05,
             "stitch_mask_target": 0.08,
-            "area_penalty": 0.25,
-            "inlier": 0.2,
+            "area_penalty": 0.0,
+            "fold": 0.02,
+            "photo_conf_threshold": 0.5,
+            "inlier_sigma_teacher": 0.04,
+            "inlier_sigma_h": 0.06,
+            "inlier_conf_thresh": 0.5,
+            "inlier_coverage": 0.01,
+            "inlier_coverage_bins": 4,
+            "inlier_coverage_min_mass": 0.03,
+            "inlier": 0.1,
         },
         "loss_weights_end": {
             "distill": 0.2,
@@ -150,21 +190,29 @@ STAGE_DEFS = [
             "cycle": 0.1,
             "geo": 0.05,
             "h_distill": 0.02,
-            "h_match": 0.01,
+            "h_match": 0.005,
             "h_residual_budget": 0.06,
-            "residual_distill": 0.04,
+            "residual_distill": 0.015,
             "stitch_residual": 0.05,
             "stitch_mask": 0.03,
             "stitch_mask_target": 0.10,
-            "area_penalty": 0.5,
-            "inlier": 0.1,
+            "area_penalty": 0.0,
+            "fold": 0.03,
+            "photo_conf_threshold": 0.5,
+            "inlier_sigma_teacher": 0.04,
+            "inlier_sigma_h": 0.06,
+            "inlier_conf_thresh": 0.5,
+            "inlier_coverage": 0.0,
+            "inlier_coverage_bins": 4,
+            "inlier_coverage_min_mass": 0.03,
+            "inlier": 0.05,
         },
     },
 ]
 
 
 def get_stage(epoch: int) -> Dict:
-    """根据 epoch 返回当前阶段配置（超出范围则使用最后一个阶段）"""
+    """Return the active stage for `epoch`; epochs beyond the range use the last stage."""
     for s in STAGE_DEFS:
         if s["epoch_start"] <= epoch <= s["epoch_end"]:
             return s
@@ -173,7 +221,7 @@ def get_stage(epoch: int) -> Dict:
 
 def interpolate_loss_weights(stage: Dict, epoch: int) -> Dict[str, float]:
     """
-    在阶段内对 Loss 权重做线性插值。
+    Linearly interpolate loss weights within a stage.
     """
     if "loss_weights" in stage:
         return dict(stage["loss_weights"])
@@ -193,9 +241,12 @@ def interpolate_loss_weights(stage: Dict, epoch: int) -> Dict[str, float]:
 
 def _get_module_param_groups(model: AgriStitcher, max_lr: Dict[str, float]) -> List[Dict]:
     """
-    按子模块分组参数，支持每组独立 LR。
-    只把 lr > 0 的组放入优化器（冻结模块不产生梯度，放入也无意义且浪费内存）。
+    Group parameters by subsystem so each group can use an independent LR.
+
+    Groups with non-positive LR are omitted to avoid optimizer state for frozen
+    modules and to make the stage schedule explicit.
     """
+    stitch_params = list(model.stitch_decoder.parameters()) if model.stitch_decoder is not None else []
     groups = [
         {
             "name": "backbone",
@@ -217,11 +268,11 @@ def _get_module_param_groups(model: AgriStitcher, max_lr: Dict[str, float]) -> L
         },
         {
             "name": "stitch_decoder",
-            "params": list(model.stitch_decoder.parameters()),
+            "params": stitch_params,
             "lr": max_lr.get("stitch_decoder", 2e-4),
         },
     ]
-    return groups
+    return [g for g in groups if g["params"]]
 
 
 def apply_freeze_state(model: AgriStitcher, stage: Dict) -> None:
@@ -249,10 +300,11 @@ def apply_freeze_state(model: AgriStitcher, stage: Dict) -> None:
         if "backbone" not in n and "inlier_predictor" not in n:
             p.requires_grad = not matcher_frozen
 
-    stitch_decoder_frozen = stitch_decoder_key in frozen
-    for p in model.stitch_decoder.parameters():
-        p.requires_grad = not stitch_decoder_frozen
-    if stitch_decoder_frozen:
+    stitch_decoder_frozen = stitch_decoder_key in frozen or model.stitch_decoder is None
+    if model.stitch_decoder is not None:
+        for p in model.stitch_decoder.parameters():
+            p.requires_grad = not stitch_decoder_frozen
+    if stitch_decoder_frozen and model.stitch_decoder is not None:
         model.stitch_decoder.eval()
 
     frozen_names = [n for n, flag in [
@@ -269,9 +321,10 @@ def build_optimizer_and_scheduler(
     weight_decay: float = 1e-4,
 ) -> Tuple[torch.optim.Optimizer, Any]:
     """
-    每次进入新阶段时调用，重建优化器和调度器。
-    OneCycleLR 自带 warmup + annealing，适合新模块激活。
-    Cosine 适合后期精细收敛。
+    Rebuild the optimizer and scheduler when the training stage changes.
+
+    OneCycleLR is used when new modules are activated. Cosine decay is used for
+    late fine-tuning after the geometry has stabilized.
     """
     param_groups = _get_module_param_groups(model, stage["max_lr"])
     optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
@@ -283,10 +336,10 @@ def build_optimizer_and_scheduler(
             optimizer,
             max_lr=[g["lr"] for g in param_groups],
             total_steps=total_steps,
-            pct_start=0.25,        # 前 25% warmup
+            pct_start=0.25,        # First 25% of steps are warm-up.
             anneal_strategy="cos",
-            div_factor=10,         # 起始 LR = max_lr / 10
-            final_div_factor=500,  # 结束 LR = max_lr / 5000（比较温柔的结尾）
+            div_factor=10,         # Initial LR = max_lr / 10.
+            final_div_factor=500,  # Final LR = max_lr / (10 * 500).
         )
     elif stage["scheduler"] == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -359,7 +412,7 @@ def extract_teacher_features_ds(
         img_b_lr: torch.Tensor,
         grid_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """提取 teacher 特征并下采样到指定尺寸"""
+    """Extract teacher features and downsample them to the requested grid size."""
     f_list_a = teacher.f(img_a_lr)
     f_list_b = teacher.f(img_b_lr)
 

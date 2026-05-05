@@ -138,6 +138,14 @@ def compute_photometric_loss(
 
 
 def compute_cycle_consistency_loss(stu_out_ab: Dict, stu_out_ba: Dict) -> torch.Tensor:
+    """
+    One-sided cycle consistency loss with an explicit detached anchor.
+
+    The A->B matcher warp is treated as a fixed routing field and the loss
+    backpropagates through the B->A prediction only. This avoids two predictions
+    chasing each other within the same loss term; bidirectional supervision, if
+    desired, should be added as a separate symmetric term.
+    """
     grid_ab = stu_out_ab["matcher_out"]["warp_AB"].detach()
     conf_a = stu_out_ab["matcher_out"]["confidence_AB"].detach()
     grid_ba = stu_out_ba["matcher_out"]["warp_AB"]
@@ -199,6 +207,118 @@ def build_inlier_pseudo_labels(
     pseudo_labels = torch.exp(-(error ** 2) / (2 * sigma ** 2))
     valid_mask = teacher_conf_fine > conf_thresh
     return pseudo_labels.reshape(B, Hf * Wf), valid_mask.reshape(B, Hf * Wf)
+
+
+@torch.no_grad()
+def build_h_inlier_pseudo_labels(
+    warp_fine: torch.Tensor,
+    teacher_warp: torch.Tensor,
+    teacher_conf: torch.Tensor,
+    h_grid_fine: torch.Tensor,
+    sigma_teacher: float = 0.04,
+    sigma_h: float = 0.06,
+    conf_thresh: float = 0.5,
+    hard_negative_margin: float = 2.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, Hf, Wf, _ = warp_fine.shape
+    device = warp_fine.device
+
+    teacher_warp_fine = F.interpolate(
+        torch.nan_to_num(teacher_warp.detach().float(), nan=0.0, posinf=1.5, neginf=-1.5)
+        .clamp(-1.5, 1.5)
+        .permute(0, 3, 1, 2),
+        size=(Hf, Wf),
+        mode="bilinear",
+        align_corners=False,
+    ).permute(0, 2, 3, 1)
+
+    conf = teacher_conf.detach().float()
+    if conf.ndim == 4 and conf.shape[-1] == 1:
+        conf = conf[..., 0]
+    elif conf.ndim == 4 and conf.shape[1] == 1:
+        conf = conf[:, 0]
+    teacher_conf_fine = F.interpolate(
+        torch.nan_to_num(conf, nan=0.0, posinf=1.0, neginf=0.0)
+        .clamp(0.0, 1.0)
+        .unsqueeze(1),
+        size=(Hf, Wf),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(1)
+
+    warp = torch.nan_to_num(warp_fine.detach().float(), nan=0.0, posinf=1.5, neginf=-1.5).clamp(-1.5, 1.5)
+    h_grid = torch.nan_to_num(h_grid_fine.detach().float(), nan=0.0, posinf=3.0, neginf=-3.0).clamp(-3.0, 3.0)
+    teacher_err = (warp - teacher_warp_fine).norm(dim=-1)
+    h_err = (warp - h_grid).norm(dim=-1)
+
+    st = max(float(sigma_teacher), 1e-6)
+    sh = max(float(sigma_h), 1e-6)
+    teacher_score = torch.exp((-(teacher_err.square()) / (2.0 * st * st)).clamp(min=-50.0, max=0.0))
+    h_score = torch.exp((-(h_err.square()) / (2.0 * sh * sh)).clamp(min=-50.0, max=0.0))
+    pseudo_labels = torch.nan_to_num(teacher_score * h_score, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+    valid_teacher = teacher_conf_fine > float(conf_thresh)
+    negative = valid_teacher & (
+        (teacher_err > float(hard_negative_margin) * st) |
+        (h_err > float(hard_negative_margin) * sh)
+    )
+    positive_or_soft = valid_teacher & (pseudo_labels > 0.05)
+    valid_mask = valid_teacher & (positive_or_soft | negative)
+
+    return (
+        pseudo_labels.reshape(B, Hf * Wf),
+        valid_mask.reshape(B, Hf * Wf),
+        teacher_conf_fine.reshape(B, Hf * Wf).clamp(0.0, 1.0),
+    )
+
+
+def compute_inlier_coverage_loss(
+    inlier_weights: torch.Tensor,
+    confidence: torch.Tensor,
+    hw: Tuple[int, int] | None = None,
+    bins: int = 4,
+    min_mass: float = 0.03,
+) -> torch.Tensor:
+    if inlier_weights is None:
+        raise ValueError("inlier_weights must not be None")
+    bins = int(max(1, bins))
+    if inlier_weights.ndim == 3 and inlier_weights.shape[-1] == 1:
+        if hw is None:
+            raise ValueError("hw must be provided when inlier_weights has shape [B,N,1]")
+        H, W = hw
+        inlier = inlier_weights.transpose(1, 2).reshape(inlier_weights.shape[0], 1, H, W)
+    elif inlier_weights.ndim == 4 and inlier_weights.shape[-1] == 1:
+        inlier = inlier_weights.permute(0, 3, 1, 2)
+    elif inlier_weights.ndim == 4 and inlier_weights.shape[1] == 1:
+        inlier = inlier_weights
+    elif inlier_weights.ndim == 3:
+        inlier = inlier_weights.unsqueeze(1)
+    else:
+        raise ValueError(f"Unsupported inlier_weights shape: {tuple(inlier_weights.shape)}")
+
+    inlier = torch.nan_to_num(inlier.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    B, _, H, W = inlier.shape
+
+    conf = confidence.float()
+    if conf.ndim == 3:
+        conf = conf.unsqueeze(1)
+    elif conf.ndim == 4 and conf.shape[-1] == 1:
+        conf = conf.permute(0, 3, 1, 2)
+    elif conf.ndim != 4:
+        raise ValueError(f"Unsupported confidence shape: {tuple(confidence.shape)}")
+    conf = torch.nan_to_num(conf, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    if conf.shape[-2:] != (H, W):
+        conf = F.interpolate(conf, size=(H, W), mode="bilinear", align_corners=False)
+
+    weight = inlier * conf.detach()
+    pooled = F.adaptive_avg_pool2d(weight, (bins, bins))
+    loss_empty = F.relu(float(min_mass) - pooled).square().mean()
+    mass = pooled.flatten(1)
+    prob = mass / (mass.sum(dim=1, keepdim=True) + 1e-6)
+    entropy = -(prob * prob.clamp_min(1e-8).log()).sum(dim=1)
+    max_entropy = math.log(float(bins * bins))
+    loss_entropy = F.relu(0.6 * max_entropy - entropy).mean()
+    return loss_empty + 0.1 * loss_entropy
 
 
 def compute_inlier_loss(

@@ -15,8 +15,10 @@ def make_grid(
         dtype: torch.dtype,
 ) -> torch.Tensor:
     """
-    生成 align_corners=False 风格的 normalized grid。
-    返回: (B, H, W, 2), 最后维度为 (x, y)，范围约 [-1, 1]
+    Create an align_corners=False normalized grid.
+
+    Returns:
+        Tensor of shape [B, H, W, 2] with the last dimension ordered as (x, y).
     """
     xs = (torch.arange(W, device=device, dtype=dtype) + 0.5) * (2.0 / W) - 1.0
     ys = (torch.arange(H, device=device, dtype=dtype) + 0.5) * (2.0 / H) - 1.0
@@ -33,16 +35,17 @@ def safe_grid_sample(
         align_corners: bool = False,
 ) -> torch.Tensor:
     """
-    安全封装 F.grid_sample，保证 shape 正确。
+    Numerically safe wrapper around F.grid_sample.
+
     feat: (B, C, H, W)
     grid: (B, H, W, 2)  normalized coords (x,y)
-    返回: (B, C, H, W)
+    Returns: (B, C, H_out, W_out)
     """
     assert feat.ndim == 4, f"feat must be (B,C,H,W), got {feat.shape}"
     assert grid.ndim == 4 and grid.shape[-1] == 2, f"grid must be (B,H_out,W_out,2), got {grid.shape}"
     assert grid.shape[0] == feat.shape[0], "grid batch must match feat batch"
 
-    # grid_sample 对 grid dtype 更敏感，显式对齐 dtype/device
+    # grid_sample is sensitive to grid dtype; force FP32 coordinates under AMP.
     out_dtype = feat.dtype
     with torch.amp.autocast("cuda", enabled=False):
         feat_f = torch.nan_to_num(feat.float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -51,7 +54,7 @@ def safe_grid_sample(
             nan=0.0, posinf=1.5, neginf=-1.5,
         ).clamp(-1.5, 1.5)
 
-    # padding_mode='border' 对拼接更稳：越界时取边界值而不是 0
+        # Border padding is often more stable for stitching than zero padding.
         sampled = F.grid_sample(
             feat_f,
             grid_f,
@@ -76,10 +79,11 @@ def upsample_warp_and_overlap(
         out_hw: Tuple[int, int],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    将 coarse 输出上采样到 refine 分辨率。
+    Upsample coarse correspondence and overlap maps to the refinement resolution.
+
     coarse_warp: (B, Hc, Wc, 2)  normalized coords (x,y)
     coarse_overlap: (B, Hc, Wc) or (B, Hc, Wc, 1)
-    返回:
+    Returns:
       warp_up: (B, Hr, Wr, 2)
       overlap_up: (B, Hr, Wr, 1)
     """
@@ -105,7 +109,7 @@ def upsample_warp_and_overlap(
 
 # Lightweight Conv Blocks
 def _gn_groups(ch: int, max_groups: int = 8) -> int:
-    # 让 GroupNorm 组数尽量整除且不太大
+    # Prefer the largest valid GroupNorm group count up to max_groups.
     for g in [max_groups, 4, 2, 1]:
         if ch % g == 0:
             return g
@@ -120,27 +124,27 @@ def compute_local_correlation(
     B, C, H, W = feat_A.shape
     ws = 2 * radius + 1
 
-    # 对 sampled_B 做 replicate padding
+    # Replicate padding keeps local correlation well-defined at borders.
     padded_B = F.pad(sampled_B, [radius] * 4, mode='replicate')  # (B,C,H+2r,W+2r)
 
-    # F.unfold 一次性提取所有 ws×ws 邻域 patch
-    # 输出形状: (B, C*ws^2, H*W)
+    # F.unfold extracts every ws x ws neighborhood in one vectorized operation.
+    # Output shape: (B, C*ws^2, H*W)
     unfolded = F.unfold(padded_B, kernel_size=ws)
 
-    # 整理为 (B, C, ws^2, H*W) 方便与 feat_A 做点积
+    # Reshape to (B, C, ws^2, H*W) for dot products against feat_A.
     unfolded = unfolded.view(B, C, ws * ws, H * W)
 
-    # feat_A 展平并增加 ws^2 维度以便广播
+    # Flatten feat_A and add the neighborhood dimension for broadcasting.
     feat_A_flat = feat_A.view(B, C, 1, H * W)  # (B, C, 1, H*W)
 
-    # 沿通道维度求点积
+    # Channel-wise dot product.
     dot = (feat_A_flat * unfolded).sum(dim=1)  # (B, ws^2, H*W)
 
-    # L2 归一化
+    # L2 normalization.
     norm_A = (feat_A_flat ** 2).sum(dim=1).add(1e-8).sqrt()
     norm_B = (unfolded ** 2).sum(dim=1).add(1e-8).sqrt()
 
-    # 余弦相似度
+    # Cosine similarity.
     corr = dot / (norm_A * norm_B + 1e-8)  # (B, ws^2, H*W)
     return corr.view(B, ws * ws, H, W)
 
@@ -161,7 +165,10 @@ class ConvGNAct(nn.Module):
 
 class DWConvGNAct(nn.Module):
     """
-    Depthwise 3x3 + Pointwise 1x1，轻量且适合部署
+    Depthwise 3x3 followed by pointwise 1x1 convolution.
+
+    This block keeps the decoder lightweight while preserving local spatial
+    context, which is useful for high-resolution stitching.
     """
 
     def __init__(self, ch: int, expansion: int = 2):
@@ -188,9 +195,9 @@ class WarpRefiner(nn.Module):
             C: int,
             hidden: int = 96,
             num_blocks: int = 2,
-            max_pixel_delta: int = 4,  # ← 改为像素数上限，而非固定归一化值
+            max_pixel_delta: int = 4,  # Pixel-domain upper bound for the delta.
             residual_overlap: bool = True,
-            corr_radius: int = 4  # 从 2 扩大到 4：搜索窗口 9×9，覆盖更大位移
+            corr_radius: int = 4  # Radius 4 gives a 9x9 local search window.
     ):
         super().__init__()
         self.corr_radius = corr_radius
@@ -198,7 +205,7 @@ class WarpRefiner(nn.Module):
         self.C = C
         self.hidden = hidden
         self.num_blocks = num_blocks
-        self.max_pixel_delta = max_pixel_delta  # 最大修正像素数
+        self.max_pixel_delta = max_pixel_delta  # Maximum correction in pixels.
         self.residual_overlap = bool(residual_overlap)
 
         in_ch = 4 * C + 5 + corr_channels + 2
@@ -255,13 +262,12 @@ class WarpRefiner(nn.Module):
         x = self.stem(x)
         x = self.blocks(x)
 
-        # 动态 delta_scale：根据当前特征图分辨率计算归一化修正上限
-        # max_pixel_delta 个像素对应的归一化距离 = max_pixel_delta * (2/H)
-        # 对 H 和 W 取较小值，保守约束
+        # Convert the pixel-domain delta bound to normalized grid units for the
+        # current feature resolution. The min(H, W) denominator is conservative.
         delta_scale = self.max_pixel_delta * (2.0 / min(H, W))
 
         delta = self.delta_head(x)
-        delta = delta_scale * torch.tanh(delta)  # 修正量被约束在 ±max_pixel_delta 像素以内
+        delta = delta_scale * torch.tanh(delta)  # Bound correction by max_pixel_delta.
 
         if delta.shape[2] != H_target or delta.shape[3] != W_target:
             delta = F.interpolate(delta, size=(H_target, W_target),
@@ -289,8 +295,10 @@ class WarpRefiner(nn.Module):
 
 class StitchingDecoder(nn.Module):
     """
-    U-Net 风格的高效 Decoder。
-    先将高分辨率 RGB 降采样到特征分辨率，完成轻量融合后，再上采样输出。
+    Efficient U-Net-style dense residual decoder.
+
+    RGB evidence is first downsampled to the feature scale, fused with aligned
+    features and the base flow, then decoded back to full image resolution.
     """
     def __init__(
             self,
@@ -302,25 +310,25 @@ class StitchingDecoder(nn.Module):
         super().__init__()
         self.residual_scale = float(residual_scale)
         
-        # RGB 降采样编码器 (H, W -> H/8, W/8) 提取高频细节
-        # 输入 6 通道: img_A + img_B_warped
+        # RGB encoder (H, W -> H/8, W/8) captures high-frequency alignment cues.
+        # Input has 6 channels: img_A concatenated with img_B_warped.
         self.rgb_stem = nn.Sequential(
             nn.Conv2d(6, 32, kernel_size=3, stride=2, padding=1), nn.GELU(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), nn.GELU(),
             nn.Conv2d(64, feat_channels, kernel_size=3, stride=2, padding=1), nn.GELU(),
         )
 
-        # 特征融合层 (在 H/8, W/8 小尺度进行，极度省显存)
+        # Feature fusion is performed at H/8, W/8 to reduce memory use.
         # feat_A(C) + feat_B_warped(C) + rgb_encoded(C) + flow(2)
         in_ch = 3 * feat_channels + 2
         self.fuse = ConvGNAct(in_ch, hidden, k=3, s=1, p=1)
 
-        # 在这个尺度下堆叠 DWConv，计算量和显存占用缩小了 64 倍！
+        # Depthwise blocks at this scale provide local context at low cost.
         self.num_blocks = int(max(1, num_blocks))
         blocks = [DWConvGNAct(hidden, expansion=2) for _ in range(self.num_blocks)]
         self.blocks = nn.Sequential(*blocks)
 
-        # 渐进式上采样解码器 (H/8, W/8 -> H, W)
+        # Progressive upsampling decoder (H/8, W/8 -> H, W).
         self.up = nn.Sequential(
             nn.ConvTranspose2d(hidden, 64, kernel_size=4, stride=2, padding=1), nn.GELU(),
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1), nn.GELU(),
@@ -343,24 +351,24 @@ class StitchingDecoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, _, H, W = img_A.shape
         
-        # RGB 降采样
+        # Encode RGB evidence at reduced resolution.
         rgb_concat = torch.cat([img_A, img_B_warped], dim=1)
         rgb_encoded = self.rgb_stem(rgb_concat) # [B, C, H/8, W/8]
 
-        # 提取基准偏移流，并缩放到 H/8
+        # Convert the base grid to a base-flow representation and downsample it.
         src_grid = make_grid(B, H, W, device=img_A.device, dtype=img_A.dtype)
         base_flow = (base_grid - src_grid).permute(0, 3, 1, 2).contiguous()
         base_flow_down = F.interpolate(base_flow, size=rgb_encoded.shape[-2:], mode="area")
 
-        # 在小尺度下进行深层拼接与卷积
+        # Fuse semantic, photometric, and geometric evidence at low resolution.
         x = torch.cat([feat_A, feat_B_warped, rgb_encoded, base_flow_down], dim=1)
         x = self.fuse(x)
         x = self.blocks(x)
 
-        # 上采样回全分辨率
+        # Decode back to full resolution.
         x = self.up(x) # [B, 16, H, W]
 
-        # 输出
+        # Predict residual flow and mask in NHWC layout for grid arithmetic.
         mask_logits = self.mask_head(x).permute(0, 2, 3, 1).contiguous()
         stitch_mask = torch.sigmoid(mask_logits)
 
@@ -369,6 +377,162 @@ class StitchingDecoder(nn.Module):
         flow = flow.permute(0, 2, 3, 1).contiguous()
 
         return flow, mask_logits, stitch_mask
+
+
+class MeshStitchingDecoder(nn.Module):
+    """
+    Low-DOF stitching decoder.
+    Predicts a coarse residual-control mesh and upsamples it to a dense residual field.
+    """
+
+    def __init__(
+            self,
+            feat_channels: int = 128,
+            hidden: int = 128,
+            num_blocks: int = 3,
+            mesh_size: int = 12,
+            max_residual_px: float = 4.0,
+            min_mask_bias: float = -3.0,
+    ):
+        super().__init__()
+        self.mesh_size = int(mesh_size)
+        self.max_residual_px = float(max_residual_px)
+        self.min_mask_bias = float(min_mask_bias)
+
+        self.rgb_stem = nn.Sequential(
+            nn.Conv2d(6, 32, kernel_size=3, stride=2, padding=1), nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), nn.GELU(),
+            nn.Conv2d(64, feat_channels, kernel_size=3, stride=2, padding=1), nn.GELU(),
+        )
+
+        in_ch = 3 * feat_channels + 2
+        self.fuse = ConvGNAct(in_ch, hidden, k=3, s=1, p=1)
+        self.blocks = nn.Sequential(*[
+            DWConvGNAct(hidden, expansion=2)
+            for _ in range(int(max(1, num_blocks)))
+        ])
+        self.mesh_pool = nn.AdaptiveAvgPool2d((self.mesh_size, self.mesh_size))
+        self.delta_head = nn.Sequential(
+            ConvGNAct(hidden, hidden, k=3, s=1, p=1),
+            nn.Conv2d(hidden, 2, kernel_size=3, padding=1),
+        )
+        self.mask_head = nn.Sequential(
+            ConvGNAct(hidden, hidden, k=3, s=1, p=1),
+            nn.Conv2d(hidden, 1, kernel_size=3, padding=1),
+        )
+        nn.init.zeros_(self.delta_head[-1].weight)
+        nn.init.zeros_(self.delta_head[-1].bias)
+        nn.init.zeros_(self.mask_head[-1].weight)
+        nn.init.zeros_(self.mask_head[-1].bias)
+
+    def forward(
+            self,
+            img_A: torch.Tensor,
+            img_B_warped: torch.Tensor,
+            feat_A: torch.Tensor,
+            feat_B_warped: torch.Tensor,
+            base_grid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        B, _, H, W = img_A.shape
+
+        rgb_concat = torch.cat([img_A, img_B_warped], dim=1)
+        rgb_feat = self.rgb_stem(rgb_concat)  # [B, C, H/8, W/8]
+        fuse_hw = rgb_feat.shape[-2:]
+
+        feat_A_low = feat_A
+        if feat_A_low.shape[-2:] != fuse_hw:
+            feat_A_low = F.interpolate(feat_A_low, size=fuse_hw, mode="bilinear", align_corners=False)
+        feat_A_low = feat_A_low.to(rgb_feat.dtype)
+        feat_B_low = feat_B_warped
+        if feat_B_low.shape[-2:] != fuse_hw:
+            feat_B_low = F.interpolate(feat_B_low, size=fuse_hw, mode="bilinear", align_corners=False)
+        feat_B_low = feat_B_low.to(rgb_feat.dtype)
+
+        with torch.amp.autocast("cuda", enabled=False):
+            src_grid = make_grid(B, H, W, device=img_A.device, dtype=torch.float32)
+            base_grid_f = torch.nan_to_num(
+                base_grid.float(), nan=0.0, posinf=3.0, neginf=-3.0
+            ).clamp(-3.0, 3.0)
+            base_flow = (base_grid_f - src_grid).permute(0, 3, 1, 2).contiguous()
+            base_flow_low = F.interpolate(base_flow, size=fuse_hw, mode="bilinear", align_corners=False)
+        base_flow_low = base_flow_low.to(rgb_feat.dtype)
+
+        x = torch.cat([feat_A_low, feat_B_low, rgb_feat, base_flow_low], dim=1)
+        x = self.blocks(self.fuse(x))
+        mesh_feat = self.mesh_pool(x)  # [B, hidden, Gh, Gw]
+
+        normalized_scale = 2.0 * self.max_residual_px / max(float(min(H, W)), 1.0)
+        mesh_delta = torch.tanh(self.delta_head(mesh_feat).float()) * normalized_scale
+        mesh_delta = torch.nan_to_num(
+            mesh_delta, nan=0.0, posinf=normalized_scale, neginf=-normalized_scale
+        ).clamp(-normalized_scale, normalized_scale)
+
+        mask_logits_lowres = self.mask_head(mesh_feat).float()
+        mesh_mask_lowres = torch.sigmoid(mask_logits_lowres + self.min_mask_bias)
+        mesh_mask_lowres = torch.nan_to_num(
+            mesh_mask_lowres, nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0)
+
+        residual_chw = F.interpolate(
+            mesh_delta, size=(H, W), mode="bicubic", align_corners=False
+        )
+        residual_chw = torch.nan_to_num(
+            residual_chw, nan=0.0, posinf=normalized_scale, neginf=-normalized_scale
+        ).clamp(-normalized_scale, normalized_scale)
+        residual_flow = residual_chw.permute(0, 2, 3, 1).contiguous().to(img_A.dtype)  # [B,H,W,2]
+
+        mask_logits = F.interpolate(
+            mask_logits_lowres + self.min_mask_bias,
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        ).permute(0, 2, 3, 1).contiguous()
+        stitch_mask = torch.sigmoid(mask_logits)
+        stitch_mask = torch.nan_to_num(
+            stitch_mask, nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0).to(img_A.dtype)  # [B,H,W,1]
+
+        aux = {
+            "mesh_delta": mesh_delta.to(img_A.dtype),  # [B,2,Gh,Gw]
+            "mesh_mask_lowres": mesh_mask_lowres.to(img_A.dtype),  # [B,1,Gh,Gw]
+            "mesh_size": self.mesh_size,
+            "max_residual_px": self.max_residual_px,
+        }
+        return residual_flow, mask_logits.to(img_A.dtype), stitch_mask, aux
+
+
+def mesh_laplacian_loss(mesh_delta: torch.Tensor) -> torch.Tensor:
+    """Second-order curvature penalty for mesh_delta [B,2,Gh,Gw]."""
+    if mesh_delta is None:
+        raise ValueError("mesh_delta must not be None")
+    delta = torch.nan_to_num(mesh_delta.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    loss = delta.new_zeros(())
+    if delta.shape[-1] >= 3:
+        dx2 = delta[..., :, 2:] - 2.0 * delta[..., :, 1:-1] + delta[..., :, :-2]
+        loss = loss + dx2.square().mean()
+    if delta.shape[-2] >= 3:
+        dy2 = delta[..., 2:, :] - 2.0 * delta[..., 1:-1, :] + delta[..., :-2, :]
+        loss = loss + dy2.square().mean()
+    return loss
+
+
+def mesh_magnitude_loss(mesh_delta: torch.Tensor) -> torch.Tensor:
+    """Mean L2 magnitude penalty for mesh_delta [B,2,Gh,Gw]."""
+    if mesh_delta is None:
+        raise ValueError("mesh_delta must not be None")
+    delta = torch.nan_to_num(mesh_delta.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+    return delta.square().sum(dim=1).clamp_min(1e-12).sqrt().mean()
+
+
+def grid_fold_loss(grid: torch.Tensor) -> torch.Tensor:
+    """Penalize local Jacobian determinant <= 0 for grid [B,H,W,2]."""
+    g = torch.nan_to_num(grid.float(), nan=0.0, posinf=3.0, neginf=-3.0).clamp(-3.0, 3.0)
+    if g.shape[1] < 2 or g.shape[2] < 2:
+        return g.new_zeros(())
+    dx = g[:, :-1, 1:, :] - g[:, :-1, :-1, :]
+    dy = g[:, 1:, :-1, :] - g[:, :-1, :-1, :]
+    det = dx[..., 0] * dy[..., 1] - dx[..., 1] * dy[..., 0]
+    return F.relu(1e-6 - det).mean()
 
 
 def ssim_map(img1, img2, window_size=7, sigma=1.5):
@@ -383,7 +547,7 @@ def ssim_map(img1, img2, window_size=7, sigma=1.5):
     window = _1D_window.mm(_1D_window.t()).unsqueeze(0).unsqueeze(0)
     window = window.expand(C, 1, window_size, window_size).contiguous()
 
-    # 均值 E[x]
+    # Mean term E[x].
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=C)
     mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=C)
 
@@ -391,14 +555,14 @@ def ssim_map(img1, img2, window_size=7, sigma=1.5):
     mu2_sq = mu2.pow(2)
     mu1_mu2 = mu1 * mu2
 
-    # 方差 E[x^2] - (E[x])^2
+    # Variance term E[x^2] - E[x]^2.
     sigma1_sq = (F.conv2d(img1 * img1, window, padding=window_size // 2, groups=C) - mu1_sq).clamp(min=0.0)
     sigma2_sq = (F.conv2d(img2 * img2, window, padding=window_size // 2, groups=C) - mu2_sq).clamp(min=0.0)
     sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=C) - mu1_mu2
 
     C1, C2 = 0.01 ** 2, 0.03 ** 2
 
-    # SSIM 公式
+    # Standard SSIM numerator and denominator.
     ssim_n = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
     ssim_d = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
 
@@ -411,33 +575,35 @@ def compute_gradient_weight_map(
         blur_radius: int = 1,
 ) -> torch.Tensor:
     """
-    用 Sobel 算子提取图像梯度幅值，生成逐像素的损失权重图。
-    梯度大（高频纹理/边缘）的区域权重被放大 amplify 倍，
-    迫使网络优先对齐茎秆、田垄等结构性特征线。
+    Build a per-pixel photometric weight map from Sobel gradient magnitude.
+
+    High-gradient image structures receive larger weights, encouraging the
+    photometric loss to prioritize stable structural cues such as field rows,
+    stems, and object boundaries.
 
     Args:
-        img:         [B, C, H, W]  归一化后的图像张量（float32）
-        amplify:     高梯度区域最大权重倍率，建议 3-5
-        blur_radius: Sobel 前先用均值模糊降噪（0=不模糊）
+        img:         [B, C, H, W] normalized image tensor.
+        amplify:     Maximum weight multiplier for high-gradient regions.
+        blur_radius: Optional mean blur radius before Sobel filtering.
 
     Returns:
-        weight_map:  [B, 1, H, W]  权重范围 [1.0, amplify]，float32
+        weight_map:  [B, 1, H, W] with values in [1.0, amplify].
     """
     assert img.ndim == 4, "img must be [B,C,H,W]"
     img_f = img.float()
     B, C, H, W = img_f.shape
     device = img_f.device
 
-    # 转灰度
+    # Convert to grayscale.
     gray = img_f.mean(dim=1, keepdim=True)  # [B, 1, H, W]
 
-    # 可选：均值模糊降噪（防止孤立噪声点被当作边缘）
+    # Optional mean blur suppresses isolated noise before edge extraction.
     if blur_radius > 0:
         k = 2 * blur_radius + 1
         blur_k = torch.ones(1, 1, k, k, device=device, dtype=torch.float32) / (k * k)
         gray = F.conv2d(gray, blur_k, padding=blur_radius)
 
-    # Sobel 核
+    # Sobel kernels for horizontal and vertical image gradients.
     sobel_x = torch.tensor(
         [[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
         device=device, dtype=torch.float32
@@ -448,140 +614,14 @@ def compute_gradient_weight_map(
     gy = F.conv2d(gray, sobel_y, padding=1)
     grad_mag = (gx ** 2 + gy ** 2).sqrt()  # [B, 1, H, W]
 
-    # 每张图独立归一化到 [0, 1]（避免批次间光照差异影响权重分布）
+    # Normalize each image independently to reduce batch-level illumination bias.
     max_val = grad_mag.flatten(1).max(dim=1).values.view(B, 1, 1, 1).clamp(min=1e-6)
     grad_norm = (grad_mag / max_val).clamp(0.0, 1.0)
 
-    # 线性混合：weight = 1 + (amplify - 1) * grad_norm
-    # → 低梯度区域权重=1.0，高梯度区域权重=amplify
+    # Linear blend: low-gradient regions keep weight 1.0, while strong
+    # gradients approach the configured amplify factor.
     weight_map = 1.0 + (amplify - 1.0) * grad_norm  # [B, 1, H, W]
-    return weight_map.detach()  # 不反传梯度到输入图像
-
-
-def compute_photometric_loss(
-        img_a,
-        img_b,
-        dense_grid,
-        confidence,
-        use_ssim: bool = False,
-        alpha: float = 0.85,
-        img_mean=(0.485, 0.456, 0.406),
-        img_std=(0.229, 0.224, 0.225),
-        grad_weight_map: torch.Tensor = None,
-):
-    """
-    光度损失，支持可选的梯度权重图（Seam-weighted Loss）。
-
-    grad_weight_map: [B, 1, H, W]，由 compute_gradient_weight_map() 从 img_a 生成。
-                     梯度高的区域（田垄/茎秆边缘）权重放大 3-5 倍，
-                     迫使网络优先对齐高频结构线而非纹理均匀区域。
-                     传 None 时退化为原始等权损失。
-    """
-    assert img_a.dtype == torch.float32, f"img_a dtype={img_a.dtype}, expected float32"
-    assert img_b.dtype == torch.float32, f"img_b dtype={img_b.dtype}, expected float32"
-    B, C, H, W = img_a.shape
-    device = img_a.device
-
-    img_a_f = img_a.float()
-    img_b_f = img_b.float()
-    dense_grid_f = dense_grid.float()
-
-    mean = torch.tensor(list(img_mean), device=device, dtype=torch.float32).view(1, 3, 1, 1)
-    std = torch.tensor(list(img_std), device=device, dtype=torch.float32).view(1, 3, 1, 1)
-
-    img_a_raw = (img_a_f * std + mean).clamp(0, 1)
-    img_b_raw = (img_b_f * std + mean).clamp(0, 1)
-
-    warped_b = F.grid_sample(img_b_raw, dense_grid_f, mode='bilinear',
-                             padding_mode='zeros', align_corners=False)
-
-    target_hw = warped_b.shape[-2:]
-    if img_a_raw.shape[-2:] != target_hw:
-        img_curr = F.interpolate(img_a_raw, size=target_hw, mode='bilinear', align_corners=False)
-    else:
-        img_curr = img_a_raw
-
-    ones = torch.ones((B, 1, *target_hw), device=device, dtype=torch.float32)
-    soft_mask = F.grid_sample(ones, dense_grid_f, mode='bilinear',
-                              padding_mode='zeros', align_corners=False)
-    # soft_mask 保留梯度用于 area_penalty，hard mask 用于 loss 权重
-    mask = (soft_mask > 0.9).float().detach()
-
-    l1_map = torch.abs(img_curr - warped_b).mean(dim=1, keepdim=True)  # [B,1,H,W]
-
-    if use_ssim:
-        s_map = ssim_map(img_curr, warped_b)
-        s_map_masked = s_map * mask.expand_as(s_map)
-        ssim_loss_map = (1.0 - s_map_masked.mean(dim=1, keepdim=True))
-        photo_loss_map = alpha * ssim_loss_map + (1.0 - alpha) * l1_map
-    else:
-        photo_loss_map = l1_map
-
-    # 置信度权重
-    conf = confidence.float()
-    if conf.ndim == 3:
-        conf = conf.unsqueeze(1)
-    if conf.shape[-2:] != target_hw:
-        conf = F.interpolate(conf, size=target_hw, mode='bilinear', align_corners=False)
-
-    base_weight = (conf.clamp(0.0, 1.0) * mask).detach()
-
-    # Seam-weighted：将梯度权重图叠加到 base_weight
-    if grad_weight_map is not None:
-        gw = grad_weight_map.float()
-        if gw.shape[-2:] != target_hw:
-            gw = F.interpolate(gw, size=target_hw, mode='bilinear', align_corners=False)
-        # 梯度权重只作用于 valid 区域（mask>0），不扩展 valid 范围
-        total_weight = base_weight * gw.detach()
-    else:
-        total_weight = base_weight
-
-    return (photo_loss_map * total_weight).sum() / (total_weight.sum() + 1e-6), soft_mask.mean()
-
-
-def compute_cycle_consistency_loss(stu_out_ab, stu_out_ba):
-    # grid_ab 是 Detach 的物理基准，代表 A -> B
-    grid_ab = stu_out_ab['matcher_out']['warp_AB'].detach()  # [B, Hf, Wf, 2]
-    conf_a = stu_out_ab['matcher_out']['confidence_AB'].detach()  # [B, Hf, Wf]
-
-    # grid_ba 是需要被优化训练的参数，代表 B -> A
-    grid_ba = stu_out_ba['matcher_out']['warp_AB']  # [B, Hf, Wf, 2]
-
-    B, H, W, _ = grid_ab.shape
-    device = grid_ab.device
-
-    # 因为 grid_ab 被 detach 了，所以这不会截断梯度，只作为客观物理条件的 Mask
-    valid_in_B = (grid_ab[..., 0].abs() <= 1.0) & \
-                 (grid_ab[..., 1].abs() <= 1.0)  # [B, H, W], bool
-
-    # 使用 padding_mode='border' 防止边界采样产生指向图片中心的错误梯度
-    back_to_a = F.grid_sample(
-        grid_ba.permute(0, 3, 1, 2),  # [B, 2, Hf, Wf]
-        grid_ab,
-        mode='bilinear',
-        padding_mode='border',  # 核心防线！
-        align_corners=False,
-    ).permute(0, 2, 3, 1)  # [B, Hf, Wf, 2]
-
-    # 构建理论完美的 identity 坐标
-    ys = (torch.arange(H, device=device, dtype=grid_ab.dtype) + 0.5) * (2.0 / H) - 1.0
-    xs = (torch.arange(W, device=device, dtype=grid_ab.dtype) + 0.5) * (2.0 / W) - 1.0
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
-    identity = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
-
-    diff = back_to_a.float() - identity.float()
-    cycle_error = (diff ** 2).sum(dim=-1).clamp(min=1e-8).sqrt()  # [B, H, W]
-
-    conf_mask = (conf_a > 0.1)  # [B, H, W], bool
-    final_mask = (valid_in_B & conf_mask).float()
-
-    # 防止所有点都失效导致的除以零 NaN
-    valid_count = final_mask.sum().clamp(min=1.0)
-
-    # 计算最终带有权重的平均误差
-    weighted_error = cycle_error * conf_a * final_mask
-
-    return weighted_error.sum() / valid_count
+    return weight_map.detach()  # Do not backpropagate through the input image.
 
 
 if __name__ == "__main__":

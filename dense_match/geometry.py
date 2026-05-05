@@ -34,45 +34,6 @@ def _sanitize_base_transform(H: torch.Tensor, max_shift: float = 0.85) -> torch.
     device = H.device
     dtype = H.dtype
 
-    eye = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
-
-    H = torch.nan_to_num(H, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    # 明确禁用透视
-    H[:, 2, 0] = 0.0
-    H[:, 2, 1] = 0.0
-    H[:, 2, 2] = 1.0
-
-    A = H[:, :2, :2]
-    sx = torch.linalg.norm(A[:, :, 0], dim=1)
-    sy = torch.linalg.norm(A[:, :, 1], dim=1)
-    det = A[:, 0, 0] * A[:, 1, 1] - A[:, 0, 1] * A[:, 1, 0]
-
-    tx = H[:, 0, 2].abs()
-    ty = H[:, 1, 2].abs()
-
-    valid = (
-        torch.isfinite(H).all(dim=(-2, -1))
-        & (sx > 0.65) & (sx < 1.40)
-        & (sy > 0.65) & (sy < 1.40)
-        & (det > 0.40) & (det < 2.00)
-        & (tx < max_shift)
-        & (ty < max_shift)
-    )
-
-    # fallback 不要直接 identity；保留安全平移
-    fallback = eye.clone()
-    fallback[:, 0, 2] = H[:, 0, 2].clamp(-max_shift, max_shift)
-    fallback[:, 1, 2] = H[:, 1, 2].clamp(-max_shift, max_shift)
-
-    return torch.where(valid.view(B, 1, 1), H, fallback)
-
-
-def _sanitize_base_transform_no_inplace(H: torch.Tensor, max_shift: float = 0.85) -> torch.Tensor:
-    B = H.shape[0]
-    device = H.device
-    dtype = H.dtype
-
     H0 = torch.nan_to_num(H, nan=0.0, posinf=1.0, neginf=-1.0)
     row0 = torch.stack([
         H0[:, 0, 0],
@@ -601,10 +562,10 @@ def solve_robust_base_transform_from_dense_flow(
     bins_y: int = 8,
     bins_x: int = 8,
     topk_per_bin: int = 8,
-    min_points: int = 48,
-    min_bins: int = 14,
-    min_quads: int = 3,
-    min_dst_span: float = 0.45,
+    min_points: int = 32,
+    min_bins: int = 8,
+    min_quads: int = 2,
+    min_dst_span: float = 0.20,
     max_shift: float = 0.75,
     allow_affine: bool = True,
     allow_similarity: bool = True,
@@ -717,7 +678,7 @@ def solve_robust_base_transform_from_dense_flow(
                 and float(dst_y_span) >= min_dst_span
             )
 
-            # 1. Translation baseline: 永远拟合，永远安全。
+            # Translation baseline: 永远拟合，永远安全。
             H_trans = _fit_translation_irls(
                 src,
                 dst,
@@ -753,7 +714,7 @@ def solve_robust_base_transform_from_dense_flow(
                 score_sim = _score_transform(H_sim, src, dst)
 
                 # similarity 必须比 translation 有明确收益才替换。
-                if sim_valid and float(score_sim["p90"]) < float(score_trans["p90"]) * 0.92:
+                if sim_valid and float(score_sim["p90"]) < float(score_trans["p90"]) * 0.98:
                     best_H = H_sim
                     best_score = score_sim
                     best_model = 2
@@ -780,7 +741,7 @@ def solve_robust_base_transform_from_dense_flow(
                     score_aff = _score_transform(H_aff, src, dst)
 
                     # affine 必须显著优于当前 best，防止用多余自由度吃重复纹理假匹配。
-                    if aff_valid and float(score_aff["p90"]) < float(best_score["p90"]) * 0.85:
+                    if aff_valid and float(score_aff["p90"]) < float(best_score["p90"]) * 0.95:
                         best_H = H_aff
                         best_score = score_aff
                         best_model = 3

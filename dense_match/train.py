@@ -34,10 +34,17 @@ from dense_match.network import (
     AgriStitcher,
     make_grid,
 )
+from dense_match.refine import (
+    grid_fold_loss,
+    mesh_laplacian_loss,
+    mesh_magnitude_loss,
+)
 from dense_match.losses import (
     DistillationLoss,
     LocalGeometricConsistency,
+    build_h_inlier_pseudo_labels,
     build_inlier_pseudo_labels,
+    compute_inlier_coverage_loss,
     compute_gradient_weight_map,
     compute_inlier_loss,
     compute_photometric_loss,
@@ -87,13 +94,15 @@ def _check_finite(name: str, x: torch.Tensor) -> bool:
 
 def plot_warped_grid(dense_grid, img_shape):
     """
-    通过物理重采样来可视化形变网格。
-    展示图 B 的均匀网格在图 A 视角下被扭曲的真实形态。
+    Visualize the deformation field by physically resampling a regular grid.
+
+    The output shows how a uniform grid in image B is warped into image A's
+    coordinate frame by the predicted dense grid.
     """
     B, H_target, W_target, _ = dense_grid.shape
     device = dense_grid.device
 
-    # 1. 生成 Batch Size 为 1 的网格图片
+    # Build a single RGB grid image that can be warped by grid_sample.
     grid_img = torch.zeros((1, 3, H_target, W_target), device=device)
     step_h = max(H_target // 16, 1)
     step_w = max(W_target // 16, 1)
@@ -113,7 +122,7 @@ def plot_warped_grid(dense_grid, img_shape):
         mode='bilinear', padding_mode='zeros', align_corners=False
     )
 
-    return warped_grid[0].cpu()  # 返回 [3, H, W] 的 RGB 张量
+    return warped_grid[0].cpu()  # [3, H, W] RGB tensor.
 
 
 def plot_grid_to_tensorboard(dense_grid, img_shape, step, writer, tag='Train/Stitch_Grid'):
@@ -135,13 +144,15 @@ def plot_grid_to_tensorboard(dense_grid, img_shape, step, writer, tag='Train/Sti
 
 def visualize_homography(H_mat: torch.Tensor, H_target: int, W_target: int) -> torch.Tensor:
     """
-    可视化单应矩阵的 warped grid（仅 H，不含 decoder 残差），
-    返回 [3, H, W] RGB 图像，蓝色网格线叠加在黑色背景上。
+    Visualize the warped grid induced by the homography branch only.
+
+    Decoder residuals are excluded so this view diagnoses the global transform.
+    Returns a [3, H, W] RGB tensor with blue grid lines on a black background.
     """
     B = H_mat.shape[0]
     device = H_mat.device
 
-    # 在目标分辨率上生成网格并投影
+    # Generate a normalized source grid at the target visualization resolution.
     grid_src = make_grid(1, H_target, W_target, device, torch.float32)  # [1, H, W, 2]
     src_pts = grid_src.reshape(1, -1, 2)
     ones = torch.ones(1, H_target * W_target, 1, device=device)
@@ -154,23 +165,23 @@ def visualize_homography(H_mat: torch.Tensor, H_target: int, W_target: int) -> t
     dst_pts = (proj[..., :2] / denom).reshape(1, H_target, W_target, 2)  # [1, H, W, 2]
     dst_pts = dst_pts.clamp(-3.0, 3.0)
 
-    # 画网格线（在 dst 坐标系画均匀间隔的线）
+    # Draw grid lines in the projected destination coordinate system.
     vis = torch.zeros(3, H_target, W_target)
     step = max(H_target // 16, 1)
     grid_np = dst_pts[0].cpu().numpy()
 
-    # 转像素坐标
+    # Convert normalized coordinates to pixel coordinates.
     px = ((grid_np[..., 0] + 1.0) / 2.0 * W_target - 0.5).astype('int32').clip(0, W_target - 1)
     py = ((grid_np[..., 1] + 1.0) / 2.0 * H_target - 0.5).astype('int32').clip(0, H_target - 1)
 
-    # 画水平线
+    # Draw horizontal grid lines.
     for r in range(0, H_target, step):
         for c in range(W_target - 1):
             x0, y0 = px[r, c], py[r, c]
             x1, y1 = px[r, c + 1], py[r, c + 1]
             if abs(x1 - x0) < W_target // 2 and abs(y1 - y0) < H_target // 2:
                 vis[2, y0, x0] = 1.0
-    # 画垂直线
+    # Draw vertical grid lines.
     for c in range(0, W_target, step):
         for r in range(H_target - 1):
             x0, y0 = px[r, c], py[r, c]
@@ -183,13 +194,14 @@ def visualize_homography(H_mat: torch.Tensor, H_target: int, W_target: int) -> t
 
 def decompose_homography_params(H_mat: torch.Tensor) -> Dict[str, float]:
     """
-    从 H 矩阵提取可解释的参数用于 TensorBoard 标量监控。
-    H 约定：dst_homo = H @ src_homo（列向量）
+    Extract interpretable homography parameters for TensorBoard diagnostics.
+
+    Convention: dst_homo = H @ src_homo for column-vector notation.
     """
     H = H_mat[0].float().cpu().numpy()
     params = {}
 
-    # translation: H[0,2], H[1,2]（归一化坐标下的平移）
+    # Translation in normalized coordinates: H[0,2], H[1,2].
     params['H_tx'] = float(H[0, 2])
     params['H_ty'] = float(H[1, 2])
 
@@ -211,13 +223,7 @@ def decompose_homography_params(H_mat: torch.Tensor) -> Dict[str, float]:
     params['H_identity_residual'] = float(np.linalg.norm(H - np.eye(3)))
 
     return params
-    B, C, H, W = img1.shape
-    img2 = img2.to(img1.device)
-    grid_h = max(H // num_squares, 1)
-    grid_w = max(W // num_squares, 1)
-    y, x = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
-    mask = ((y // grid_h) % 2 == (x // grid_w) % 2).float().to(img1.device)
-    return img1 * mask + img2 * (1 - mask)
+    
 
 
 def colorize_heatmap(tensor, cmap='jet'):
@@ -288,7 +294,7 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
     matcher_out = stu_out['matcher_out']
     dense_grid = stu_out['dense_grid']
     H_mat = stu_out.get('H_mat')          # [B, 3, 3]
-    H_base_grid = stu_out.get('H_base_grid')  # [B, H, W, 2] — 纯H，无decoder残差
+    H_base_grid = stu_out.get('H_base_grid')  # [B, H, W, 2], H-only grid without decoder residual.
     device = img_a.device
     H_target, W_target = dense_grid.shape[1:3]
 
@@ -307,16 +313,16 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
         blended_vis = img_a_vis * (1 - mask * 0.5) + warped_b_vis * (mask * 0.5)
         conf_color = _map_to_canvas(matcher_out['confidence_AB'][0:1], (H_target, W_target), cmap='jet')
 
-        # ── 完整 warp 网格（含 decoder 残差）
+        # Full warp grid including decoder residuals.
         grid_vis = plot_warped_grid(dense_grid, (H_target, W_target))
 
-        # ── 纯 H 网格（不含 decoder 残差），用于诊断 H 是否有效
+        # H-only grid without decoder residuals; useful for diagnosing H quality.
         if H_mat is not None:
             H_grid_vis = visualize_homography(H_mat, H_target, W_target)
         else:
             H_grid_vis = torch.zeros(3, H_target, W_target)
 
-        # ── 纯 H warped image（诊断 H 质量）
+        # H-only warped image for global-transform diagnostics.
         if H_base_grid is not None:
             warped_b_H = F.grid_sample(
                 img_b.to(H_base_grid.dtype),
@@ -329,7 +335,7 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
             warped_b_H_vis = torch.zeros_like(img_a_vis)
             diff_H_vis = torch.zeros_like(diff_vis)
 
-        # ── Decoder 残差幅度（= final_grid - H_base_grid）
+        # Decoder residual magnitude: final_grid - H_base_grid.
         if H_base_grid is not None:
             residual_map = (dense_grid - H_base_grid).norm(dim=-1)[0:1]
             residual_vis = _map_to_canvas(residual_map, (H_target, W_target), cmap='magma')
@@ -378,13 +384,13 @@ def visualize_results(img_a, img_b, stu_out, step, writer, phase="Train"):
                 inlier_canvas = _map_to_canvas(iw_map, (H_target, W_target), cmap='magma')
                 writer.add_image(f'{phase}/Debug_InlierWeights', inlier_canvas, step)
 
-        # ── H 参数标量到 TensorBoard
+        # Log interpretable H parameters to TensorBoard.
         if H_mat is not None:
             h_params = decompose_homography_params(H_mat)
             for k, v in h_params.items():
                 writer.add_scalar(f"{phase}/H_params/{k}", v, step)
 
-        # ── Dashboard 布局 ──
+        # Dashboard layout.
         # Row 1: img_a | img_b | warped_b(full) | checker
         # Row 2: conf | diff(full) | full_grid_overlay | H_grid_overlay
         # Row 3: warped_b_H_only | diff_H | residual(decoder_delta) | stitch_mask
@@ -510,9 +516,11 @@ def compute_h_only_losses(
     h_budget_w = float(weights.get("h_residual_budget", 0.0))
     need_loss = h_distill_w > 0.0 or h_match_w > 0.0 or h_budget_w > 0.0
     zero = torch.zeros((), device=device, dtype=torch.float32)
-    h_grid = stu_out.get("H_proxy_grid_train")
+    h_grid = stu_out.get("H_base_grid_train")
     if not need_loss or h_grid is None:
         return zero, zero, zero
+    if torch.is_grad_enabled() and not h_grid.requires_grad:
+        raise RuntimeError("H_base_grid_train must require grad when H-only losses are enabled.")
 
     with torch.amp.autocast("cuda", enabled=False):
         h_grid = torch.nan_to_num(h_grid.float(), nan=0.0, posinf=3.0, neginf=-3.0).clamp(-3.0, 3.0)
@@ -534,7 +542,8 @@ def compute_h_only_losses(
                 align_corners=False,
             ).squeeze(1)
             t_conf_dense = torch.nan_to_num(t_conf_dense, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-            conf_denom = t_conf_dense.sum().clamp_min(1e-6)
+            t_weight = (t_conf_dense * (t_conf_dense > 0.5).float()).detach()
+            conf_denom = t_weight.sum().clamp_min(1e-6)
 
             h_distill_err_map = F.huber_loss(
                 h_grid,
@@ -543,7 +552,7 @@ def compute_h_only_losses(
                 delta=0.5,
             ).sum(dim=-1)
             h_distill_err_map = torch.nan_to_num(h_distill_err_map, nan=0.0, posinf=10.0, neginf=0.0).clamp(0.0, 10.0)
-            h_distill_loss = (h_distill_err_map * t_conf_dense).sum() / conf_denom
+            h_distill_loss = (h_distill_err_map * t_weight).sum() / conf_denom
         else:
             t_warp_dense = None
             t_conf_dense = None
@@ -565,8 +574,9 @@ def compute_h_only_losses(
             h_grid_lowres = torch.nan_to_num(h_grid_lowres, nan=0.0, posinf=3.0, neginf=-3.0).clamp(-3.0, 3.0)
             warp_ab_f = torch.nan_to_num(warp_ab.float(), nan=0.0, posinf=1.5, neginf=-1.5).clamp(-1.5, 1.5)
             conf_ab_f = torch.nan_to_num(conf_ab.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            h_match_weight = (conf_ab_f * (conf_ab_f > 0.5).float()).detach()
             h_match_err = F.huber_loss(h_grid_lowres, warp_ab_f.detach(), reduction="none", delta=0.25).sum(dim=-1)
-            h_match_loss = (h_match_err * conf_ab_f.detach()).sum() / conf_ab_f.detach().sum().clamp_min(1e-6)
+            h_match_loss = (h_match_err * h_match_weight).sum() / h_match_weight.sum().clamp_min(1e-6)
         else:
             h_match_loss = zero
 
@@ -584,7 +594,7 @@ def compute_h_only_losses(
                 h_error = torch.sqrt((2.0 * h_distill_err_map.detach()).clamp_min(0.0))
             residual_budget = (0.01 + 0.35 * h_error).clamp(0.01, 0.25)
             over_budget = F.relu(residual_norm - residual_budget)
-            h_residual_budget_loss = (over_budget.square() * t_conf_dense).sum() / conf_denom
+            h_residual_budget_loss = (over_budget.square() * t_weight).sum() / conf_denom
         else:
             h_residual_budget_loss = zero
 
@@ -620,7 +630,7 @@ def restore_stage_train_modes(student: nn.Module, stage: Optional[Dict]) -> None
         return
     if "backbone" in stage.get("freeze", []) or not stage.get("unfreeze_backbone", True):
         student.matcher.backbone.eval()
-    if "stitch_decoder" in stage.get("freeze", []):
+    if "stitch_decoder" in stage.get("freeze", []) and student.stitch_decoder is not None:
         student.stitch_decoder.eval()
     if "inlier_predictor" in stage.get("freeze", []) or not stage.get("use_inlier_predictor", False):
         student.matcher.inlier_predictor.eval()
@@ -628,37 +638,49 @@ def restore_stage_train_modes(student: nn.Module, stage: Optional[Dict]) -> None
 
 def _legacy_residual_smoothness_loss(residual_flow: torch.Tensor) -> torch.Tensor:
     """
-    惩罚局部形变场（相对于 H 基准）的空间非平滑性。
+    Penalize spatial curvature of the local residual field relative to the H base.
+
+    The second-order difference is insensitive to purely linear residual fields,
+    so it regularizes local bending rather than global affine motion.
     residual_flow: (B, H, W, 2)
     """
     flow = residual_flow.permute(0, 3, 1, 2).float()  # [B, 2, H, W]
 
-    # 二阶差分（Laplacian），对线性形变免疫
+    # Second-order finite differences approximate a Laplacian curvature penalty.
     lap_x = flow[:, :, :, 2:] - 2 * flow[:, :, :, 1:-1] + flow[:, :, :, :-2]
     lap_y = flow[:, :, 2:, :] - 2 * flow[:, :, 1:-1, :] + flow[:, :, :-2, :]
 
     return lap_x.pow(2).mean() + lap_y.pow(2).mean()
 
 
+def compute_valid_area_ratio(grid: torch.Tensor) -> torch.Tensor:
+    grid_f = torch.nan_to_num(grid.float(), nan=0.0, posinf=3.0, neginf=-3.0).clamp(-3.0, 3.0)
+    valid = (
+            (grid_f[..., 0] >= -1.0) & (grid_f[..., 0] <= 1.0) &
+            (grid_f[..., 1] >= -1.0) & (grid_f[..., 1] <= 1.0)
+    )
+    return valid.float().mean()
+
+
 @torch.no_grad()
 def _legacy_build_inlier_pseudo_labels(
         warp_fine: torch.Tensor,  # [B, Hf, Wf, 2]  student fine warp
-        teacher_warp: torch.Tensor,  # [B, Ht, Wt, 2]  teacher warp (可能尺寸不同)
+        teacher_warp: torch.Tensor,  # [B, Ht, Wt, 2] teacher warp; size may differ.
         teacher_conf: torch.Tensor,  # [B, Ht, Wt]     teacher confidence
-        sigma: float = 0.05,  # 归一化坐标下的误差容忍半径
-        conf_thresh: float = 0.1,  # teacher 置信度低于此值的点不参与监督
+        sigma: float = 0.05,  # Error tolerance radius in normalized coordinates.
+        conf_thresh: float = 0.1,  # Ignore teacher points below this confidence.
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    基于 Teacher Warp 场构建 InlierPredictor 的软标签。
+    Build teacher-only soft pseudo labels for the legacy InlierPredictor path.
 
-    返回:
-        pseudo_labels: [B, Hf*Wf]  软标签 ∈ [0, 1]
-        valid_mask:    [B, Hf*Wf]  bool，只有 teacher 置信度高的点才参与 loss
+    Returns:
+        pseudo_labels: [B, Hf*Wf] soft labels in [0, 1].
+        valid_mask:    [B, Hf*Wf] bool mask for high-confidence teacher points.
     """
     B, Hf, Wf, _ = warp_fine.shape
     device = warp_fine.device
 
-    # 把 teacher warp 插值到 fine 分辨率
+    # Interpolate teacher warp and confidence to the student's fine resolution.
     teacher_warp_fine = F.interpolate(
         teacher_warp.permute(0, 3, 1, 2).float(),  # [B, 2, Ht, Wt]
         size=(Hf, Wf),
@@ -673,45 +695,47 @@ def _legacy_build_inlier_pseudo_labels(
         align_corners=False,
     ).squeeze(1)  # [B, Hf, Wf]
 
-    # 计算 student 和 teacher 之间的预测误差（归一化坐标距离）
+    # Prediction error between student and teacher in normalized coordinates.
     error = (warp_fine.float() - teacher_warp_fine).norm(dim=-1)  # [B, Hf, Wf]
 
-    # 高斯软标签：误差越小，标签越接近 1
+    # Gaussian soft label: smaller error produces a label closer to one.
     pseudo_labels = torch.exp(-(error ** 2) / (2 * sigma ** 2))  # [B, Hf, Wf]
 
-    # valid_mask：只监督 teacher 置信度足够高的区域
-    #    teacher 在重复纹理区置信度低，对应伪标签不可靠
+    # Supervise only high-confidence teacher regions; repeated textures often
+    # have unreliable teacher confidence and should not drive the inlier head.
     valid_mask = (teacher_conf_fine > conf_thresh)  # [B, Hf, Wf], bool
 
     return pseudo_labels.reshape(B, Hf * Wf), valid_mask.reshape(B, Hf * Wf)
 
 
 def _legacy_compute_inlier_loss(
-        inlier_weights: torch.Tensor,  # [B, N, 1]  InlierPredictor 输出
-        pseudo_labels: torch.Tensor,  # [B, N]     软标签
+        inlier_weights: torch.Tensor,  # [B, N, 1] InlierPredictor output.
+        pseudo_labels: torch.Tensor,  # [B, N] soft labels.
         valid_mask: torch.Tensor,  # [B, N]     bool
-        teacher_conf: torch.Tensor,  # [B, N]     teacher 置信度，用于加权
-        focal_gamma: float = 2.0,  # Focal Loss 参数，抑制易分样本
+        teacher_conf: torch.Tensor,  # [B, N] teacher confidence used as weight.
+        focal_gamma: float = 2.0,  # Focal-loss exponent for easy samples.
 ) -> torch.Tensor:
     """
-    Focal BCE Loss，对难分样本（预测与标签差距大）给更高梯度。
-    同时用 teacher_conf 加权，让高置信区域的监督更强。
+    Focal BCE loss for inlier prediction.
+
+    High-confidence teacher regions receive larger weight, while focal weighting
+    emphasizes samples where the prediction is far from the pseudo label.
     """
     w = inlier_weights.squeeze(-1)  # [B, N]
     y = pseudo_labels.float().detach()  # [B, N]
 
-    # Focal 权重：预测接近标签时权重小，预测偏差大时权重大
-    # pt = w * y + (1-w) * (1-y)  ← 预测正确的概率
+    # Focal weight is small for well-predicted samples and large for hard cases.
+    # pt = w * y + (1-w) * (1-y) is the probability of the pseudo target.
     pt = w * y + (1.0 - w) * (1.0 - y)
     focal_weight = (1.0 - pt.detach()).pow(focal_gamma)
 
-    # Binary Cross Entropy（数值稳定版）
+    # Numerically stable binary cross entropy.
     bce = F.binary_cross_entropy(w.clamp(1e-6, 1 - 1e-6), y, reduction='none')  # [B, N]
 
-    # 组合 loss
+    # Combine BCE with focal weights.
     focal_loss = focal_weight * bce  # [B, N]
 
-    # teacher confidence 加权：高置信区域监督信号更可靠
+    # Teacher-confidence weighting keeps unreliable pseudo labels weak.
     weight = teacher_conf.float().detach() * valid_mask.float().detach()  # [B, N]
     valid_count = weight.sum().clamp(min=1.0)
 
@@ -733,8 +757,10 @@ def compute_loss_bundle(
         use_cycle: bool = False,
 ) -> Dict[str, Any]:
     """
-    统一的 Loss 计算函数。
-    w 由调用方根据当前 epoch 动态插值传入，不在此函数内查询 epoch。
+    Unified loss computation for one training step.
+
+    The caller provides stage-interpolated weights in `w`; this function does
+    not query epoch state directly.
     """
     teacher_conf_prob = teacher_confidence_prob(t_out)
     teacher_warp = torch.nan_to_num(
@@ -743,6 +769,7 @@ def compute_loss_bundle(
     with torch.amp.autocast("cuda", enabled=amp_enabled):
         stu_out = student(img_a, img_b)
         stu_output = stu_out["matcher_out"]
+        residual_mode = stu_out.get("residual_mode", "dense")
 
         final_grid = stu_out["dense_grid"]
         conf_refine = stu_output['confidence_AB']
@@ -782,9 +809,18 @@ def compute_loss_bundle(
                 teacher_conf_prob.unsqueeze(1),
                 size=(H, W), mode='bilinear', align_corners=False
             ).squeeze(1).clamp(0.0, 1.0)
-        # Huber 误差
-            residual_distill_err = F.huber_loss(final_grid, t_warp_dense, reduction="none", delta=1.0).sum(dim=-1)
-            residual_distill_loss = (residual_distill_err * t_conf_dense).sum() / (t_conf_dense.sum() + 1e-6)
+        # Huber residual-distillation error gated by teacher confidence.
+            teacher_gate = (t_conf_dense > 0.5).float()
+            residual_distill_weight = (t_conf_dense * teacher_gate).detach()
+            residual_distill_err = F.huber_loss(
+                final_grid,
+                t_warp_dense.detach(),
+                reduction="none",
+                delta=0.25,
+            ).sum(dim=-1)
+            residual_distill_loss = (
+                    residual_distill_err * residual_distill_weight
+            ).sum() / (residual_distill_weight.sum() + 1e-6)
         else:
             residual_distill_loss = torch.zeros((), device=device)
         h_distill_loss, h_match_loss, h_residual_budget_loss = compute_h_only_losses(
@@ -797,22 +833,44 @@ def compute_loss_bundle(
 
         f_loss = torch.zeros((), device=device)
 
+        mesh_delta = stu_out.get("mesh_delta")
+        mesh_mask_lowres = stu_out.get("mesh_mask_lowres")
+        mesh_lap = torch.zeros((), device=device)
+        mesh_mag = torch.zeros((), device=device)
         if stitch_residual is not None and w.get("stitch_residual", 0.0) > 0:
-            smooth_loss = residual_smoothness_loss(stitch_residual.float())
+            if residual_mode == "mesh" and mesh_delta is not None:
+                mesh_lap = mesh_laplacian_loss(mesh_delta)
+                mesh_mag = mesh_magnitude_loss(mesh_delta)
+                smooth_loss = mesh_lap + 0.1 * mesh_mag
+            else:
+                smooth_loss = residual_smoothness_loss(stitch_residual.float())
         else:
             smooth_loss = torch.zeros((), device=device)
         stitch_mask = stu_out.get("stitch_mask")
         if stitch_mask is not None and w.get("stitch_mask", 0.0) > 0:
-            mask_tv = residual_smoothness_loss(stitch_mask.expand(-1, -1, -1, 2))
-            mask_mean = stitch_mask.mean()
+            if residual_mode == "mesh" and mesh_mask_lowres is not None:
+                mask_for_reg = mesh_mask_lowres
+                mask_dense_for_tv = F.interpolate(
+                    mesh_mask_lowres.float(),
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).permute(0, 2, 3, 1)
+            else:
+                mask_for_reg = stitch_mask
+                mask_dense_for_tv = stitch_mask
+            mask_tv = residual_smoothness_loss(mask_dense_for_tv.expand(-1, -1, -1, 2))
+            mask_mean = mask_for_reg.mean()
             mask_target = max(0.0, min(0.5, float(w.get("stitch_mask_target", 0.08))))
             mask_sparsity = F.relu(mask_mean - mask_target).square()
-            mask_reg = mask_tv + 0.25 * mask_sparsity
+            mask_reg = mask_tv + 0.25 * mask_sparsity + 0.02 * mask_mean
         else:
             mask_reg = torch.zeros((), device=device)
             mask_mean = torch.zeros((), device=device)
+        fold_loss = grid_fold_loss(final_grid.float()) if w.get("fold", 0.0) > 0 else torch.zeros((), device=device)
 
-        # Cycle Loss
+        # One-sided cycle loss: AB is the detached anchor and gradients update
+        # the auxiliary BA prediction. See compute_cycle_consistency_loss.
         if use_cycle and w.get("cycle", 0.0) > 0:
             noise_std = 0.02
             img_b_noisy = (img_b + torch.randn_like(img_b) * noise_std).clamp(
@@ -824,23 +882,54 @@ def compute_loss_bundle(
         else:
             c_loss = torch.zeros((), device=device)
         inlier_w = w.get("inlier", 0.0)
-        if inlier_w > 0 and student.matcher.use_inlier_predictor:
-            # 从 matcher 内部取出 inlier_weights（需要在 forward 里额外返回）
-            inlier_weights = stu_output.get("inlier_weights")
+        inlier_coverage_loss = torch.zeros((), device=device)
+        h_inlier_pos_ratio = torch.zeros((), device=device)
+        h_inlier_valid_ratio = torch.zeros((), device=device)
+        h_inlier_used = torch.zeros((), device=device)
+        inlier_weights = stu_output.get("raw_inlier_weights", stu_output.get("inlier_weights"))
+        if inlier_w > 0 and student.matcher.use_inlier_predictor and inlier_weights is not None:
+            # Use raw inlier probabilities returned by the matcher; solver
+            # weights are detached and are not used for the inlier BCE loss.
             if inlier_weights is not None:
                 Hf, Wf = stu_output['fine_hw']
-                pseudo_labels, valid_mask = build_inlier_pseudo_labels(
-                    warp_fine=stu_output['warp_AB'].detach(),  # student fine warp
-                    teacher_warp=teacher_warp,
-                    teacher_conf=teacher_conf_prob,
-                    sigma=0.05,
-                    conf_thresh=0.15,
-                )
-                # teacher_conf 在 fine 分辨率下的 flatten 版本（复用 pseudo_labels 的中间结果）
-                teacher_conf_fine_flat = F.interpolate(
-                    teacher_conf_prob.unsqueeze(1),
-                    size=(Hf, Wf), mode='bilinear', align_corners=False
-                ).squeeze(1).reshape(inlier_weights.shape[0], -1).clamp(0.0, 1.0)
+                h_grid = stu_out.get("H_base_grid_train", None)
+                if h_grid is not None:
+                    h_grid_fine = F.interpolate(
+                        h_grid.permute(0, 3, 1, 2).float(),
+                        size=(Hf, Wf), mode='bilinear', align_corners=False
+                    ).permute(0, 2, 3, 1)
+                    # H-aware labels are detached targets: they check whether a
+                    # dense correspondence is both teacher-consistent and
+                    # explainable by the current trainable H_final grid.
+                    pseudo_labels, valid_mask, teacher_conf_fine_flat = build_h_inlier_pseudo_labels(
+                        warp_fine=stu_output['warp_AB'].detach(),
+                        teacher_warp=teacher_warp,
+                        teacher_conf=teacher_conf_prob,
+                        h_grid_fine=h_grid_fine.detach(),
+                        sigma_teacher=w.get("inlier_sigma_teacher", 0.04),
+                        sigma_h=w.get("inlier_sigma_h", 0.06),
+                        conf_thresh=w.get("inlier_conf_thresh", 0.5),
+                    )
+                    h_inlier_used = torch.ones((), device=device)
+                else:
+                    pseudo_labels, valid_mask = build_inlier_pseudo_labels(
+                        warp_fine=stu_output['warp_AB'].detach(),
+                        teacher_warp=teacher_warp,
+                        teacher_conf=teacher_conf_prob,
+                        sigma=0.05,
+                        conf_thresh=0.15,
+                    )
+                    # Flatten teacher confidence at the fine resolution for loss weighting.
+                    teacher_conf_fine_flat = F.interpolate(
+                        teacher_conf_prob.unsqueeze(1),
+                        size=(Hf, Wf), mode='bilinear', align_corners=False
+                    ).squeeze(1).reshape(inlier_weights.shape[0], -1).clamp(0.0, 1.0)
+                    if not getattr(compute_loss_bundle, "_warned_h_inlier_fallback", False):
+                        print("[Warning] H_base_grid_train missing; falling back to teacher-only inlier pseudo labels.")
+                        compute_loss_bundle._warned_h_inlier_fallback = True
+                valid_mask_f = valid_mask.float()
+                h_inlier_valid_ratio = valid_mask_f.mean()
+                h_inlier_pos_ratio = ((pseudo_labels > 0.5).float() * valid_mask_f).sum() / valid_mask_f.sum().clamp_min(1.0)
 
                 inlier_loss = compute_inlier_loss(
                     inlier_weights=inlier_weights,
@@ -854,6 +943,16 @@ def compute_loss_bundle(
         else:
             inlier_loss = torch.zeros((), device=device)
 
+        if inlier_weights is not None and w.get("inlier_coverage", 0.0) > 0:
+            Hf_cov, Wf_cov = stu_output['fine_hw']
+            inlier_coverage_loss = compute_inlier_coverage_loss(
+                inlier_weights,
+                stu_output['confidence_AB'],
+                hw=(Hf_cov, Wf_cov),
+                bins=int(w.get("inlier_coverage_bins", 4)),
+                min_mass=float(w.get("inlier_coverage_min_mass", 0.03)),
+            )
+
         total_no_photo = (
                 w["distill"] * d_loss["total"]
                 + w["cycle"] * c_loss
@@ -865,6 +964,8 @@ def compute_loss_bundle(
                 + w.get("h_distill", 0.0) * h_distill_loss
                 + w.get("h_match", 0.0) * h_match_loss
                 + w.get("h_residual_budget", 0.0) * h_residual_budget_loss
+                + w.get("fold", 0.0) * fold_loss
+                + w.get("inlier_coverage", 0.0) * inlier_coverage_loss
         )
 
     photo_w = w.get("photo", 0.0)
@@ -872,26 +973,37 @@ def compute_loss_bundle(
         with torch.amp.autocast("cuda", enabled=False):
             use_ssim_now = w.get("ssim", 0.0) > 0.01
 
-            # Sobel 梯度权重图：从 img_a 提取高频结构线（田垄/茎秆边缘），
-            # 这些区域的光度误差权重放大 4 倍，强制网络优先对齐结构性特征。
+            # Sobel gradient weights emphasize stable high-frequency structures
+            # such as field rows and stems during photometric supervision.
             grad_wmap = compute_gradient_weight_map(
                 img_a.float(), amplify=2.0, blur_radius=1
-            )  # [B, 1, H, W]，不反传梯度
+            )  # [B, 1, H, W], detached from the input image.
+
+            photo_conf = stu_out["matcher_out"]["confidence_AB"].float()
+            conf_threshold = float(w.get("photo_conf_threshold", 0.0))
+            if conf_threshold > 0.0:
+                photo_conf = photo_conf * (photo_conf > conf_threshold).float()
 
             p_loss, area_ratio = compute_photometric_loss(
                 img_a.float(), img_b.float(),
                 stu_out["dense_grid"].float(),
-                stu_out["matcher_out"]["confidence_AB"].float(),
+                photo_conf,
                 use_ssim=use_ssim_now,
                 alpha=0.85,
                 grad_weight_map=grad_wmap,
             )
 
-            # 面积惩罚：有效重叠区域过小时额外惩罚（梯度可回传，soft_mask 带梯度）
-            area_penalty_w = w.get("area_penalty", 0.5)
-            area_penalty = F.relu(0.3 - area_ratio) * area_penalty_w
+            # Area penalty is handled below with detached area ratio so it does
+            # not drive the decoder to fold the grid inward.
     else:
         p_loss = torch.zeros((), device=device)
+        area_ratio = compute_valid_area_ratio(stu_out["dense_grid"].float()).detach()
+
+    area_penalty_w = w.get("area_penalty", 0.0)
+    if area_penalty_w > 0:
+        area_ratio_for_penalty = compute_valid_area_ratio(stu_out["dense_grid"].float()).detach()
+        area_penalty = F.relu(0.3 - area_ratio_for_penalty) * area_penalty_w
+    else:
         area_penalty = torch.zeros((), device=device)
 
     total_loss = total_no_photo + photo_w * p_loss + area_penalty
@@ -899,8 +1011,13 @@ def compute_loss_bundle(
     conf_mean = float(conf_for_geo.detach().mean())
     valid_overlap = stu_out.get("valid_overlap_mask")
     valid_overlap_ratio = float(valid_overlap.detach().float().mean()) if valid_overlap is not None else 0.0
-    inlier_weights = stu_output.get("inlier_weights")
+    inlier_weights = stu_output.get("raw_inlier_weights", stu_output.get("inlier_weights"))
     inlier_mean = float(inlier_weights.detach().mean()) if inlier_weights is not None else None
+    raw_inlier_mean = float(inlier_mean) if inlier_mean is not None else 0.0
+    solver_weight_mean_t = stu_output.get("solver_weight_mean")
+    solver_weight_nonzero_t = stu_output.get("solver_weight_nonzero_ratio")
+    solver_weight_mean = float(solver_weight_mean_t.detach()) if torch.is_tensor(solver_weight_mean_t) else 0.0
+    solver_weight_nonzero_ratio = float(solver_weight_nonzero_t.detach()) if torch.is_tensor(solver_weight_nonzero_t) else 0.0
     stitch_ratio = float(mask_mean.detach()) if torch.is_tensor(mask_mean) else float(mask_mean)
     residual_mean = (
         float(stitch_residual.detach().norm(dim=-1).mean())
@@ -922,11 +1039,22 @@ def compute_loss_bundle(
         'residual_distill': residual_distill_loss,
         'stitch_smooth': smooth_loss,
         'mask_reg': mask_reg,
+        'inlier_coverage': inlier_coverage_loss,
+        'fold': fold_loss,
+        'mesh_lap': mesh_lap,
+        'mesh_mag': mesh_mag,
         'total': total_loss,
+        'residual_mode': residual_mode,
         'stitch_ratio': stitch_ratio,
         'conf_mean': conf_mean,
         'valid_overlap_ratio': valid_overlap_ratio,
         'inlier_mean': inlier_mean,
+        'raw_inlier_mean': raw_inlier_mean,
+        'solver_weight_mean': solver_weight_mean,
+        'solver_weight_nonzero_ratio': solver_weight_nonzero_ratio,
+        'h_inlier_pos_ratio': h_inlier_pos_ratio,
+        'h_inlier_valid_ratio': h_inlier_valid_ratio,
+        'h_inlier_used': float(h_inlier_used.detach()),
         'residual_mean': residual_mean,
         'area_ratio': area_ratio_value,
     }
@@ -954,8 +1082,13 @@ def validate(
             'distill', 'photo', 'cycle', 'geo', 'inlier',
             'h_distill', 'h_match', 'h_residual_budget',
             'residual_distill', 'stitch_smooth', 'mask_reg',
+            'inlier_coverage',
+            'fold', 'mesh_lap', 'mesh_mag',
             'area_penalty', 'total', 'stitch_ratio',
             'conf_mean', 'valid_overlap_ratio', 'residual_mean', 'area_ratio',
+            'solver_weight_mean', 'solver_weight_nonzero_ratio',
+            'raw_inlier_mean', 'h_inlier_pos_ratio', 'h_inlier_valid_ratio',
+            'h_inlier_used',
         )
     }
     count = 0
@@ -1012,7 +1145,7 @@ def save_checkpoint(
     print(f"Checkpoint saved. val={val_loss:.6f}  best={best_val_loss:.6f}")
     if is_best:
         shutil.copyfile(last_path, save_dir / "best.pt")
-        print(f"✅ New best: {val_loss:.6f}")
+        print(f"[best] New best: {val_loss:.6f}")
     return last_path
 
 
@@ -1024,26 +1157,26 @@ def load_checkpoint(
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     try:
         student.load_state_dict(ckpt["student"], strict=True)
-        print("[load] ✅ Model loaded (strict)")
+        print("[load] Model loaded (strict)")
     except RuntimeError as e:
-        print(f"[load] ⚠️ Strict load failed: {e}")
+        print(f"[load] Strict load failed: {e}")
         missing, unexpected = student.load_state_dict(ckpt["student"], strict=False)
         print(f"[load] Loaded with missing={len(missing)}, unexpected={len(unexpected)}")
     if optimizer and "optimizer" in ckpt:
         try:
             optimizer.load_state_dict(ckpt["optimizer"])
         except Exception as e:
-            print(f"[load] ⚠️ Optimizer load failed: {e}")
+            print(f"[load] Optimizer load failed: {e}")
     if scheduler and ckpt.get("scheduler"):
         try:
             scheduler.load_state_dict(ckpt["scheduler"])
         except Exception as e:
-            print(f"[load] ⚠️ Scheduler load failed: {e}")
+            print(f"[load] Scheduler load failed: {e}")
     if scaler and "scaler" in ckpt:
         try:
             scaler.load_state_dict(ckpt["scaler"])
         except Exception as e:
-            print(f"[load] ⚠️ Scaler load failed: {e}")
+            print(f"[load] Scaler load failed: {e}")
     best_val_loss = ckpt.get("best_val_loss", ckpt.get("best_loss", float("inf")))
     return (
         int(ckpt.get("epoch", 0)),
@@ -1063,6 +1196,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--teacher-grid-size", type=int, default=32)
+    p.add_argument("--residual-mode", choices=["dense", "mesh", "none"], default="mesh")
+    p.add_argument("--mesh-size", type=int, default=12)
+    p.add_argument("--max-residual-px", type=float, default=4.0)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--epochs", type=int, default=65)
     p.add_argument("--num-workers", type=int, default=4)
@@ -1072,7 +1208,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--force-amp", action="store_true")
     p.add_argument("--accum-steps", type=int, default=4)
     p.add_argument("--teacher-setting", type=str, default="precise")
-    # DistillationLoss 参数
+    # DistillationLoss hyperparameters.
     p.add_argument("--alpha", type=float, default=0.05)
     p.add_argument("--beta-coarse", type=float, default=1.0)
     p.add_argument("--beta-refine", type=float, default=1.5)
@@ -1119,7 +1255,7 @@ def main() -> None:
 
     use_cache = args.cache_dir is not None and args.cache_dir.exists()
     if use_cache:
-        print(f"[Dataset] 缓存模式: {args.cache_dir}")
+        print(f"[Dataset] cache mode: {args.cache_dir}")
         suffix = args.cache_dir.suffix.lower() if args.cache_dir.is_file() else ""
         if suffix in {".h5", ".hdf5"}:
             train_ds = BucketedH5TeacherDataset(str(args.cache_dir), args.val_ratio, args.seed, 'train')
@@ -1136,8 +1272,8 @@ def main() -> None:
             val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **cache_loader_kwargs)
     else:
         if args.pairs_file is None:
-            raise ValueError("必须提供 --pairs-file 或有效的 --cache-dir")
-        print(f"[Dataset] 原始图像对模式: {args.pairs_file}")
+            raise ValueError("Either --pairs-file or a valid --cache-dir must be provided.")
+        print(f"[Dataset] raw image-pair mode: {args.pairs_file}")
         train_ds = MultiScaleDataset(args.pairs_file, args.val_ratio, return_split='train')
         val_ds = MultiScaleDataset(args.pairs_file, args.val_ratio, return_split='val')
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **image_loader_kwargs)
@@ -1147,7 +1283,12 @@ def main() -> None:
     student = AgriStitcher(
         matcher_config={'d_model': args.d_model, 'teacher_dim': actual_teacher_dim,
                         'grid_size': args.teacher_grid_size},
-        decoder_config={'feat_channels': args.d_model}
+        decoder_config={
+            'feat_channels': args.d_model,
+            'residual_mode': args.residual_mode,
+            'mesh_size': args.mesh_size,
+            'max_residual_px': args.max_residual_px,
+        }
     ).to(device)
     student_ema = copy.deepcopy(student).eval()
     for p in student_ema.parameters():
@@ -1181,7 +1322,7 @@ def main() -> None:
                 print(f"[Resume] EMA loaded with missing={len(missing)}, unexpected={len(unexpected)}")
         else:
             student_ema.load_state_dict(student.state_dict(), strict=False)
-        start_epoch = int(ckpt.get("epoch", 1)) + 1  # 从下一个 epoch 继续
+        start_epoch = int(ckpt.get("epoch", 1)) + 1  # Resume from the next epoch.
         global_step = int(ckpt.get("step", 0))
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
         last_val_loss = float(ckpt.get("val_loss", float("inf")))
@@ -1220,21 +1361,21 @@ def main() -> None:
 
         new_stage = get_stage(epoch)
         if new_stage is not current_stage:
-            print(f"\n{'═' * 60}")
-            print(f"[Stage Transition] Epoch {epoch} → Stage: {new_stage['name']}")
-            print(f"{'═' * 60}")
+            print(f"\n{'=' * 60}")
+            print(f"[Stage Transition] Epoch {epoch} -> Stage: {new_stage['name']}")
+            print(f"{'=' * 60}")
             current_stage = new_stage
 
-            # 更新冻结/解冻状态
+            # Update frozen/unfrozen module state.
             apply_freeze_state(student, current_stage)
 
-            # 重建优化器和调度器
+            # Rebuild optimizer and scheduler for the new stage.
             optimizer, scheduler = update_optimizer_and_scheduler(
                 student, current_stage, steps_per_epoch, args.weight_decay,
                 optimizer=optimizer
             )
 
-            # 打印当前参数组信息
+            # Print active parameter-group diagnostics.
             for g in optimizer.param_groups:
                 n_params = sum(p.numel() for p in g['params'])
                 print(f"  Param group '{g.get('name', '?')}': lr={g['lr']:.2e}, params={n_params:,}")
@@ -1243,21 +1384,21 @@ def main() -> None:
         w = interpolate_loss_weights(current_stage, epoch)
         use_cycle_this_epoch = w.get("cycle", 0.0) > 0.01
 
-        # 记录到 TensorBoard
+        # Log stage loss weights to TensorBoard.
         for k, v in w.items():
             writer.add_scalar(f"LossWeights/{k}", v, epoch)
 
         if use_cache and isinstance(getattr(train_loader, 'batch_sampler', None), BucketedBatchSampler):
             train_loader.batch_sampler.set_epoch(epoch)
 
-        print(f"\n🚀 Epoch {epoch}/{args.epochs} | Stage: {current_stage['name']}")
+        print(f"\n[Epoch] {epoch}/{args.epochs} | Stage: {current_stage['name']}")
         print(f"   Weights: {', '.join(f'{k}={v:.3f}' for k, v in w.items() if v > 0)}")
 
         student.train()
-        # 保持冻结模块处于 eval 状态（防止 BN 被小 batch 破坏）
+        # Keep frozen modules in eval mode to avoid small-batch BN drift.
         if "backbone" in current_stage.get("freeze", []) or not current_stage.get("unfreeze_backbone", True):
             student.matcher.backbone.eval()
-        if "stitch_decoder" in current_stage.get("freeze", []):
+        if "stitch_decoder" in current_stage.get("freeze", []) and student.stitch_decoder is not None:
             student.stitch_decoder.eval()
 
         pbar = tqdm(enumerate(train_loader), total=len(train_loader),
@@ -1310,16 +1451,18 @@ def main() -> None:
                     'distill', 'photo', 'cycle', 'geo',
                     'h_distill', 'h_match', 'h_residual_budget',
                     'residual_distill', 'stitch_smooth', 'mask_reg',
+                    'inlier_coverage',
+                    'fold', 'mesh_lap', 'mesh_mag',
                     'area_penalty', 'total',
                 )
             }
             has_nan = False
             for k, v in loss_dict.items():
                 if torch.is_tensor(v) and not torch.isfinite(v).all():
-                    pbar.write(f"🚨 [NaN/Inf] Loss '{k}' invalid!")
+                    pbar.write(f"[NaN/Inf] Loss '{k}' invalid!")
                     has_nan = True
             if has_nan:
-                pbar.write(f"⏭️ Skipping batch at step {global_step}")
+                pbar.write(f"[skip] Skipping batch at step {global_step}")
                 optimizer.zero_grad(set_to_none=True)
                 accum_count = 0
                 if device.type == "cuda":
@@ -1341,7 +1484,7 @@ def main() -> None:
                 if has_nan_grad:
                     shown = ", ".join(bad_grad_names[:8])
                     more = "" if len(bad_grad_names) <= 8 else f", ... +{len(bad_grad_names) - 8} more"
-                    pbar.write(f"🛡️ [GradShield] NaN gradient at step {global_step}! Bad params: {shown}{more}")
+                    pbar.write(f"[GradShield] NaN gradient at step {global_step}! Bad params: {shown}{more}")
                     optimizer.zero_grad(set_to_none=True)
                     accum_count = 0
                 else:
@@ -1374,7 +1517,12 @@ def main() -> None:
                     'residual_distill': float(bundle['residual_distill'].detach()),
                     'stitch_smooth': float(bundle['stitch_smooth'].detach()),
                     'mask_reg': float(bundle['mask_reg'].detach()),
+                    'inlier_coverage': float(bundle['inlier_coverage'].detach()),
+                    'fold': float(bundle['fold'].detach()),
+                    'mesh_lap': float(bundle['mesh_lap'].detach()),
+                    'mesh_mag': float(bundle['mesh_mag'].detach()),
                     'area_penalty': float(bundle['area_penalty'].detach()),
+                    'h_inlier_used': float(bundle.get('h_inlier_used', 0.0)),
                 }
                 smoothed = loss_tracker.update(loss_metrics)
                 stitch_ratio = float(bundle['stitch_ratio'])
@@ -1421,7 +1569,7 @@ def main() -> None:
                     )
                     val_total = val_losses['total']
                     last_val_loss = val_total
-                    pbar.write(f"📊 [val] step={global_step} | total={val_total:.4f} | "
+                    pbar.write(f"[val] step={global_step} | total={val_total:.4f} | "
                                f"photo={val_losses['photo']:.4f} | smooth={val_losses['stitch_smooth']:.4f}")
                     for k, v in val_losses.items():
                         writer.add_scalar(f"Val/{k}", v, global_step)

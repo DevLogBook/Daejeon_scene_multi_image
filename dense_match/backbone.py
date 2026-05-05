@@ -18,22 +18,22 @@ class BiFPNLayer(nn.Module):
         self.conv4_up = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
             nn.Conv2d(channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels), nn.GELU()
+            nn.GroupNorm(min(32, channels // 4), channels), nn.GELU()
         )
         self.conv8_up = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
             nn.Conv2d(channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels), nn.GELU()
+            nn.GroupNorm(min(32, channels // 4), channels), nn.GELU()
         )
         self.conv8_down = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
             nn.Conv2d(channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels), nn.GELU()
+            nn.GroupNorm(min(32, channels // 4), channels), nn.GELU()
         )
         self.conv16_down = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
             nn.Conv2d(channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels), nn.GELU()
+            nn.GroupNorm(min(32, channels // 4), channels), nn.GELU()
         )
 
         self.w1 = nn.Parameter(torch.ones(2))  # p8, p16_up
@@ -42,11 +42,10 @@ class BiFPNLayer(nn.Module):
         self.w4 = nn.Parameter(torch.ones(2))  # p16, p8_down
 
     def forward(self, p4, p8, p16):
-        # 使用 ReLU 保证权重为正（比 abs 计算略快），并加上 epsilon 避免除以 0
-        w1 = F.relu(self.w1) + self.epsilon
-        w2 = F.relu(self.w2) + self.epsilon
-        w3 = F.relu(self.w3) + self.epsilon
-        w4 = F.relu(self.w4) + self.epsilon
+        w1 = F.softplus(self.w1) + self.epsilon
+        w2 = F.softplus(self.w2) + self.epsilon
+        w3 = F.softplus(self.w3) + self.epsilon
+        w4 = F.softplus(self.w4) + self.epsilon
 
         # --- Top-Down Path ---
         p16_up = F.interpolate(p16, size=p8.shape[-2:], mode='bilinear', align_corners=False)
@@ -105,15 +104,15 @@ class MobileViTBackbone(nn.Module):
 
         self.bifpn = BiFPNLayer(out_channels)
 
-        # 最终输出校准
         self.out_fine = nn.Sequential(
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(min(32, out_channels // 4), out_channels),
             nn.GELU()
         )
         self.out_coarse = nn.Sequential(
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(min(32, out_channels // 4), out_channels),
             nn.GELU()
         )
+        self.fuse_fine = nn.Conv2d(out_channels * 2, out_channels, 1, bias=False)
 
     def forward(self, x):
         features = self.mobilevit(x)
@@ -131,7 +130,7 @@ class MobileViTBackbone(nn.Module):
         # BiFPN 双向特征融合
         f4, f8, f16 = self.bifpn(p4, p8, p16)
 
-        feat_fine = self.out_fine(f8)  # [B, 128, H/8, W/8]
-        feat_coarse = self.out_coarse(f16)  # [B, 128, H/16, W/16]
-
+        f4_down = F.interpolate(f4, size=f8.shape[-2:], mode='bilinear', align_corners=False)
+        feat_fine = self.out_fine(self.fuse_fine(torch.cat([f8, f4_down], dim=1)))
+        feat_coarse = self.out_coarse(f16)
         return feat_coarse, feat_fine

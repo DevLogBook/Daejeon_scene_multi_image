@@ -1,5 +1,4 @@
-import functools
-import math
+﻿import math
 from typing import Tuple
 
 import torch
@@ -9,22 +8,20 @@ import torch.nn.functional as F
 from dense_match.backbone import MobileViTBackbone
 from dense_match.refine import (WarpRefiner,
                                 StitchingDecoder,
+                                MeshStitchingDecoder,
                                 upsample_warp_and_overlap,
                                 make_grid, safe_grid_sample)
 from dense_match.geometry import (
-    _sanitize_tensor,
-    _sanitize_homography,
-    _sanitize_base_transform_no_inplace,
-    project_grid_with_h,
-    solve_robust_base_transform_from_dense_flow,
-)
+                                _sanitize_tensor,
+                                _sanitize_homography,
+                                _sanitize_base_transform,
+                                project_grid_with_h,
+                                solve_robust_base_transform_from_dense_flow)
 from dense_match.heads import ContextAwareInlierPredictor, GlobalSimilarityHead
 
 
-
-
 def _gn_groups(ch: int, max_groups: int = 8) -> int:
-    """计算 GroupNorm 的组数"""
+    """Compute a valid GroupNorm group count."""
     for g in [max_groups, 4, 2, 1]:
         if ch % g == 0:
             return g
@@ -110,10 +107,10 @@ class MatchWindowAttention(nn.Module):
         return pe.unsqueeze(0)  # Shape: [1, window_size*window_size, d_model]
 
     def window_partition(self, x, H, W):
-        """将特征图划分为窗口"""
+        """Partition token features into local windows."""
         B, N, C = x.shape
         x = x.view(B, H, W, C)
-        # 填充以确保能被 window_size 整除
+        # Pad spatial dimensions so each feature map is divisible by window_size.
         pad_h = (self.window_size - H % self.window_size) % self.window_size
         pad_w = (self.window_size - W % self.window_size) % self.window_size
         if pad_h > 0 or pad_w > 0:
@@ -125,11 +122,11 @@ class MatchWindowAttention(nn.Module):
         return windows, (Hp, Wp)
 
     def window_reverse(self, windows, H, W, Hp, Wp):
-        """将窗口还原回特征图"""
+        """Restore local windows back to the token feature map."""
         B = windows.shape[0] // ((Hp // self.window_size) * (Wp // self.window_size))
         x = windows.view(B, Hp // self.window_size, Wp // self.window_size, self.window_size, self.window_size, -1)
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
-        # 裁切掉填充部分
+        # Remove the padded region introduced by window partitioning.
         return x[:, :H, :W, :].reshape(B, H * W, -1)
 
     def forward(self, feat_A, feat_B, H, W):
@@ -141,8 +138,9 @@ class MatchWindowAttention(nn.Module):
         win_A = win_A + self.local_pe
         win_B = win_B + self.local_pe
 
-        # Local Cross Attention (A attends to B within the same window)
-        # 这里的逻辑是：只在对应的空间窗口内寻找匹配，适合位移不大的精细化匹配
+        # Legacy same-window cross-attention. This assumes small local displacement
+        # and is kept for checkpoint compatibility; the main AgriMatcher path no
+        # longer uses it before coarse global matching.
         attn_A, _ = self.mha_A(win_A, win_B, win_B)
         attn_B, _ = self.mha_B(win_B, win_A, win_A)
 
@@ -159,9 +157,11 @@ class MatchWindowAttention(nn.Module):
 
 class LocalGeometricValidator(nn.Module):
     """
-    验证候选匹配的局部几何一致性。
-    向量化实现：将 K 个候选合并到 batch 维度，单次 avg_pool2d 完成全部计算。
-    count_include_pad=False 修复了边缘区域方差系统性偏高的问题。
+    Estimate local geometric consistency for top-k correspondence candidates.
+
+    Each candidate induces a displacement field. The validator measures the
+    neighborhood variance of that field with a vectorized avg-pooling pass.
+    `count_include_pad=False` avoids padding-induced variance bias near borders.
     """
 
     def __init__(self, neighbor_radius: int = 3):
@@ -173,18 +173,20 @@ class LocalGeometricValidator(nn.Module):
         """
         src_pos:             [B, N, 2]
         candidate_positions: [B, N, K, 2]
-        返回:                [B, N, K]  几何一致性得分，越大越好
+        Returns:             [B, N, K] consistency scores; larger is better.
         """
         B, N, K, _ = candidate_positions.shape
         src_2d = src_pos.reshape(B, H, W, 2).permute(0, 3, 1, 2)  # [B, 2, H, W]
 
-        # 将 K 个候选合并到 batch 维度，一次完成全部 avg_pool2d
-        # candidate_positions: [B, N, K, 2] → permute → [B, K, N, 2] → reshape → [B*K, H, W, 2]
+        # Merge K candidate fields into the batch dimension so one avg_pool2d
+        # evaluates all candidate displacement fields.
+        # candidate_positions: [B, N, K, 2] -> [B, K, N, 2] -> [B*K, H, W, 2]
         cand_all = candidate_positions.permute(0, 2, 1, 3).reshape(B * K, H, W, 2).permute(0, 3, 1, 2)
         src_expanded = src_2d.unsqueeze(1).expand(-1, K, -1, -1, -1).reshape(B * K, 2, H, W)
         disp_all = cand_all - src_expanded  # [B*K, 2, H, W]
 
-        # count_include_pad=False：边缘像素只用实际邻域均值，消除零填充对方差的系统性拉偏
+        # Border pixels average over valid neighbors only; this removes the
+        # systematic variance bias introduced by zero padding.
         mean_disp = F.avg_pool2d(
             disp_all, self.kernel_size, stride=1,
             padding=self.radius, count_include_pad=False
@@ -201,7 +203,7 @@ class LocalGeometricValidator(nn.Module):
 
 
 class MultiPeakAwareAttention(nn.Module):
-    def __init__(self, d_model=128, top_k=8, sinkhorn_iters=15):  # 修改迭代次数为 15
+    def __init__(self, d_model=128, top_k=8, sinkhorn_iters=15):
         super().__init__()
         self.top_k = top_k
         self.sinkhorn_iters = sinkhorn_iters
@@ -211,18 +213,18 @@ class MultiPeakAwareAttention(nn.Module):
 
     def optimal_transport(self, scores, current_temp):
         """
-        scores: [B, M, N] 已被 current_temp 除过的相似度矩阵
-        current_temp: 当前温度参数，用于对齐 dustbin 分数
+        scores: [B, M, N] similarity logits already scaled by current_temp.
+        current_temp: temperature used to scale the dustbin score consistently.
         """
-        # 强制转为 FP32，免疫 AMP 导致的 logsumexp 溢出 NaN
+        # Force FP32 for log-domain optimal transport; AMP half precision can
+        # overflow or underflow in logsumexp on low-overlap image pairs.
         scores_f32 = torch.nan_to_num(
             scores.float(), nan=0.0, posinf=50.0, neginf=-50.0
         ).clamp(-50.0, 50.0)
         B, M, N = scores_f32.shape
         device = scores_f32.device
 
-        # 将垃圾桶分数除以温度，使其与传入的 scores 尺度一致
-        temp = torch.as_tensor(current_temp, device=device, dtype=torch.float32).clamp(min=0.03, max=10.0)
+        temp = torch.as_tensor(current_temp, device=device, dtype=torch.float32).clamp(min=0.20, max=10.0)
         ds = (self.dustbin_score.float() / temp).clamp(-50.0, 50.0)
 
         row_dust = ds.view(1, 1, 1).expand(B, M, 1)  # [B, M, 1]
@@ -241,7 +243,8 @@ class MultiPeakAwareAttention(nn.Module):
 
         u, v = torch.zeros_like(log_mu), torch.zeros_like(log_nu)
 
-        # 前 sinkhorn_iters - 1 次不计算梯度以节省显存和算力
+        # Run all but the final Sinkhorn iteration without gradients to reduce
+        # memory while keeping the last normalization step differentiable.
         with torch.no_grad():
             for _ in range(self.sinkhorn_iters - 1):
                 u = log_mu - torch.logsumexp(Z + v.unsqueeze(1), dim=2)
@@ -252,7 +255,7 @@ class MultiPeakAwareAttention(nn.Module):
 
         log_assign = Z + u.unsqueeze(2) + v.unsqueeze(1)
         log_assign = torch.nan_to_num(log_assign, nan=-50.0, posinf=0.0, neginf=-50.0)
-        # 转回原始的 dtype (FP16 或 FP32) 以保持外层计算图兼容
+        # Return the real assignment block; the caller controls downstream dtype.
         return log_assign[:, :M, :N]
 
     def forward(self, feat_A, feat_B, pos_A, pos_B, H, W, current_temp, pos_B_for_geo=None):
@@ -274,11 +277,26 @@ class MultiPeakAwareAttention(nn.Module):
         row_mass = ot_prob_f32.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         prob_dist = (ot_prob_f32 / row_mass).to(feat_A.dtype)
         valid_prob_sum = (row_mass * float(log_assign.shape[1] + log_assign.shape[2])).clamp(0.0, 1.0).to(feat_A.dtype)
-        ot_prob_matrix = ot_prob_f32.to(feat_A.dtype)
 
         base_expected_pos_B = torch.bmm(prob_dist.to(pos_B.dtype), pos_B)
 
-        topk_values, topk_indices = ot_prob_matrix.topk(self.top_k, dim=-1)
+        # Select candidate correspondences once from assignment probability, then
+        # gather every candidate-dependent quantity with the same indices. This
+        # keeps probability mass, log-probability, position, and geometry aligned.
+        topk_values, topk_indices = ot_prob_f32.topk(self.top_k, dim=-1)
+        top1_mass = topk_values[..., 0].float()
+        if self.top_k >= 2:
+            top2_mass = topk_values[..., 1].float()
+        else:
+            top2_mass = torch.zeros_like(top1_mass)
+        row_mass_scalar = row_mass.squeeze(-1).float().clamp_min(1e-8)
+        valid_mass = valid_prob_sum.squeeze(-1).float().clamp(0.0, 1.0)
+        peak_ratio = (top1_mass / row_mass_scalar).clamp(0.0, 1.0)
+        peak_margin = ((top1_mass - top2_mass) / row_mass_scalar).clamp(0.0, 1.0)
+        match_confidence = (0.6 * peak_ratio + 0.4 * peak_margin) * valid_mass
+        match_confidence = torch.nan_to_num(
+            match_confidence, nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0).to(feat_A.dtype)
 
         topk_positions = torch.gather(
             pos_B.unsqueeze(1).expand(-1, N, -1, -1),
@@ -294,8 +312,7 @@ class MultiPeakAwareAttention(nn.Module):
         geo_scores = self.geometric_validator(pos_A, topk_positions_for_geo, H, W)
         geo_weight = self.geo_weight.clamp(0.0, 2.0)
 
-        # 将几何得分转化为对 Top-K 坐标的局部微调
-        topk_logp, topk_indices = log_assign.float().topk(self.top_k, dim=-1)
+        topk_logp = torch.gather(log_assign.float(), dim=-1, index=topk_indices)
         combined_scores = topk_logp + geo_weight.float() * geo_scores.float()
         soft_weights = F.softmax(combined_scores, dim=-1).to(feat_A.dtype)
         geo_refined_offset = (topk_positions * soft_weights.unsqueeze(-1)).sum(dim=2) - base_expected_pos_B.detach()
@@ -306,9 +323,222 @@ class MultiPeakAwareAttention(nn.Module):
         entropy = -(prob_dist.float() * prob_dist.float().clamp_min(1e-8).log()).sum(dim=-1)
         entropy = entropy.to(feat_A.dtype) * valid_prob_sum.squeeze(-1)
 
-        return refined_warp, entropy, raw_sim_matrix, geo_scores
+        return refined_warp, entropy, raw_sim_matrix, geo_scores, match_confidence
 
 
+class ConvGNAct(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, k: int = 3, p: int = None):
+        super().__init__()
+        if p is None:
+            p = k // 2
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=p, bias=False),
+            nn.GroupNorm(_gn_groups(out_ch), out_ch),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class GeometryAwareFusion(nn.Module):
+    """
+    Fuse A features with B features sampled by the coarse correspondence field.
+
+    The displacement and confidence channels expose the geometric route to the
+    convolutional fusion block without assuming same-index spatial alignment.
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        in_ch = d_model * 4 + 3
+        self.fuse = nn.Sequential(
+            ConvGNAct(in_ch, d_model, k=1, p=0),
+            ConvGNAct(d_model, d_model, k=3),
+            nn.Conv2d(d_model, d_model, kernel_size=1, bias=False),
+            nn.GroupNorm(_gn_groups(d_model), d_model),
+            nn.GELU(),
+        )
+
+    def forward(
+            self,
+            feat_A_map: torch.Tensor,
+            feat_B_map: torch.Tensor,
+            coarse_warp: torch.Tensor,
+            confidence: torch.Tensor,
+    ) -> torch.Tensor:
+        B, C, H, W = feat_A_map.shape
+        out_dtype = feat_A_map.dtype
+
+        warp = torch.nan_to_num(
+            coarse_warp.float(), nan=0.0, posinf=1.5, neginf=-1.5
+        ).clamp(-1.5, 1.5)
+
+        feat_B_warped = safe_grid_sample(
+            feat_B_map,
+            warp,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+
+        src_grid = make_grid(B, H, W, feat_A_map.device, torch.float32)
+        disp = (warp - src_grid).permute(0, 3, 1, 2).to(out_dtype)
+
+        if confidence.ndim == 4:
+            conf = confidence.squeeze(-1)
+        else:
+            conf = confidence
+        conf = torch.nan_to_num(
+            conf.float(), nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0).unsqueeze(1).to(out_dtype)
+
+        fused_in = torch.cat([
+            feat_A_map,
+            feat_B_warped,
+            (feat_A_map - feat_B_warped).abs(),
+            feat_A_map * feat_B_warped,
+            disp,
+            conf,
+        ], dim=1)
+        return self.fuse(fused_in)
+
+
+class WarpAwareLocalRefiner(nn.Module):
+    """
+    Refine dense correspondences with a small search window in the original B space.
+
+    Sampling locations are routed by a detached coarse warp so refinement losses
+    train the local delta predictor without pulling the coarse matcher through
+    the grid-sampling path in the stable training setting.
+    """
+
+    def __init__(
+            self,
+            d_model: int,
+            hidden: int = 64,
+            max_delta_px: int = 4,
+            corr_radius: int = 1,
+    ):
+        super().__init__()
+        self.max_delta_px = float(max_delta_px)
+        self.corr_radius = int(corr_radius)
+        corr_ch = (2 * self.corr_radius + 1) ** 2
+        in_ch = d_model * 3 + 2 + 1 + corr_ch
+
+        self.encoder = nn.Sequential(
+            ConvGNAct(in_ch, hidden, k=1, p=0),
+            ConvGNAct(hidden, hidden, k=3),
+            ConvGNAct(hidden, hidden, k=3),
+        )
+        self.delta_head = nn.Conv2d(hidden, 2, kernel_size=3, padding=1)
+        self.conf_head = nn.Conv2d(hidden, 1, kernel_size=3, padding=1)
+        nn.init.zeros_(self.delta_head.weight)
+        nn.init.zeros_(self.delta_head.bias)
+        nn.init.zeros_(self.conf_head.weight)
+        nn.init.zeros_(self.conf_head.bias)
+
+    def _warp_aware_correlation(
+            self,
+            feat_A: torch.Tensor,
+            feat_B: torch.Tensor,
+            route_warp: torch.Tensor,
+    ) -> torch.Tensor:
+        B, C, H, W = feat_A.shape
+        r = self.corr_radius
+        feat_A_n = F.normalize(
+            torch.nan_to_num(feat_A.float(), nan=0.0, posinf=0.0, neginf=0.0),
+            p=2,
+            dim=1,
+        )
+        feat_B_f = torch.nan_to_num(feat_B.float(), nan=0.0, posinf=0.0, neginf=0.0)
+
+        corr_list = []
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                offset = torch.tensor(
+                    [2.0 * dx / max(float(W), 1.0), 2.0 * dy / max(float(H), 1.0)],
+                    device=route_warp.device,
+                    dtype=torch.float32,
+                ).view(1, 1, 1, 2)
+                grid = torch.nan_to_num(
+                    route_warp.float() + offset, nan=0.0, posinf=1.5, neginf=-1.5
+                ).clamp(-1.5, 1.5)
+                sampled = safe_grid_sample(
+                    feat_B_f,
+                    grid,
+                    mode="bilinear",
+                    padding_mode="border",
+                    align_corners=False,
+                )
+                sampled_n = F.normalize(sampled.float(), p=2, dim=1)
+                corr_list.append((feat_A_n * sampled_n).sum(dim=1, keepdim=True))
+
+        return torch.cat(corr_list, dim=1).to(feat_A.dtype)
+
+    def forward(
+            self,
+            feat_A_map: torch.Tensor,
+            feat_B_map: torch.Tensor,
+            coarse_warp: torch.Tensor,
+            confidence: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, _, H, W = feat_A_map.shape
+        out_dtype = feat_A_map.dtype
+
+        coarse_warp_safe = torch.nan_to_num(
+            coarse_warp.float(), nan=0.0, posinf=1.5, neginf=-1.5
+        ).clamp(-1.5, 1.5)
+        route_warp = coarse_warp_safe.detach()
+        warped_B = safe_grid_sample(
+            feat_B_map,
+            route_warp,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+
+        src_grid = make_grid(B, H, W, feat_A_map.device, torch.float32)
+        disp = (coarse_warp_safe - src_grid).permute(0, 3, 1, 2).to(out_dtype)
+
+        if confidence.ndim == 4:
+            conf = confidence.squeeze(-1)
+        else:
+            conf = confidence
+        conf = torch.nan_to_num(
+            conf.float(), nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0)
+        conf_chw = conf.unsqueeze(1).to(out_dtype)
+
+        corr = self._warp_aware_correlation(feat_A_map, feat_B_map, route_warp)
+        x = torch.cat([
+            feat_A_map,
+            warped_B,
+            (feat_A_map - warped_B).abs(),
+            disp,
+            conf_chw,
+            corr,
+        ], dim=1)
+
+        hidden = self.encoder(x)
+        delta_raw = torch.tanh(self.delta_head(hidden)).permute(0, 2, 3, 1)
+        delta_scale = torch.tensor(
+            [
+                2.0 * self.max_delta_px / max(float(W), 1.0),
+                2.0 * self.max_delta_px / max(float(H), 1.0),
+            ],
+            device=feat_A_map.device,
+            dtype=torch.float32,
+        ).view(1, 1, 1, 2)
+        delta_flow = delta_raw.float() * delta_scale
+        fine_warp = torch.nan_to_num(
+            route_warp + delta_flow, nan=0.0, posinf=1.5, neginf=-1.5
+        ).clamp(-1.5, 1.5).to(out_dtype)
+
+        conf_delta_logits = self.conf_head(hidden).squeeze(1).float()
+        base_logit = torch.logit(conf.clamp(1e-4, 1.0 - 1e-4))
+        refined_conf_logits = base_logit + 0.5 * conf_delta_logits
+        refined_conf = torch.sigmoid(refined_conf_logits).clamp(0.0, 1.0).to(out_dtype)
+        return fine_warp, refined_conf, refined_conf_logits.to(out_dtype)
 
 
 class AgriMatcher(nn.Module):
@@ -324,15 +554,28 @@ class AgriMatcher(nn.Module):
         self.register_buffer('omega', omega)
         self.pos_scale = nn.Parameter(torch.tensor(1.0))
 
-        self.attn_layers = nn.ModuleList([
+        self.global_encoder = nn.ModuleList([
             MatchAttention(d_model, nhead=4),
-            MatchWindowAttention(d_model, num_heads=4, window_size=8),
-            MatchWindowAttention(d_model, num_heads=4, window_size=8),
-            MatchAttention(d_model, nhead=4)
+            MatchAttention(d_model, nhead=4),
         ])
-        self.peak_aware_layer = MultiPeakAwareAttention(d_model=d_model, top_k=4)
+        self.peak_aware_layer = MultiPeakAwareAttention(
+            d_model=d_model,
+            top_k=4,
+            sinkhorn_iters=10,
+        )
+        self.geometry_fusion = GeometryAwareFusion(d_model)
+        self.warp_aware_refiner = WarpAwareLocalRefiner(
+            d_model=d_model,
+            hidden=max(32, d_model // 2),
+            max_delta_px=4,
+        )
+        self.warp_aware_refiner_fine = WarpAwareLocalRefiner(
+            d_model=d_model,
+            hidden=max(32, d_model // 2),
+            max_delta_px=2,
+        )
 
-        self.temperature = nn.Parameter(torch.tensor(1.0))  # 从高温开始，由优化器逐步衰减
+        self.temperature = nn.Parameter(torch.tensor(1.0))
         self.feature_projector = nn.Linear(d_model, teacher_dim)
 
         self.coord_embed = nn.Linear(2, d_model)
@@ -348,17 +591,16 @@ class AgriMatcher(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, 1),
         )
+        # Deprecated: kept only for backward checkpoint compatibility. Not used in V3 forward.
         self.refiner_64 = WarpRefiner(
             C=d_model,
             hidden=max(32, d_model // 2),
             num_blocks=1,
             max_pixel_delta=4,
             residual_overlap=True,
-            corr_radius=4,  # 9×9 搜索窗口，覆盖更大位移
+            corr_radius=4,
         )
 
-        # ContextAwareInlierPredictor: NG-RANSAC 风格的语义引导权重头
-        # 替代纯几何 margin 权重，解决重复纹理欺骗 IRLS 的漏洞
         self.inlier_predictor = ContextAwareInlierPredictor(
             feat_dim=d_model,
             feat_compress_dim=32,
@@ -367,203 +609,153 @@ class AgriMatcher(nn.Module):
         )
         self.h_proxy_head = GlobalSimilarityHead(feat_dim=d_model, hidden=128)
 
+    def _forward_legacy_window(self, *args, **kwargs):
+        raise RuntimeError(
+            "_forward_legacy_window has been deprecated. Use AgriMatcher.forward "
+            "with Global -> MultiPeak -> GeometryFusion -> WarpAwareRefiner."
+        )
+
     def forward(self, img_A, img_B, H_prior=None):
         B = img_A.shape[0]
-
         device = img_A.device
         dtype = img_A.dtype
 
-        # Backbone 提取特征
         feat_A_coarse, feat_A_fine = self.backbone(img_A)
         feat_B_coarse, feat_B_fine = self.backbone(img_B)
-
-        # 获取实际的 coarse 特征图尺寸（动态）
         _, _, Hc, Wc = feat_A_coarse.shape
         _, _, Hf, Wf = feat_A_fine.shape
         N_coarse = Hc * Wc
 
-        # 展平为 token 序列
-        feat_A = feat_A_coarse.flatten(2).transpose(1, 2)  # (B, N, d)
-        feat_B_orig = feat_B_coarse.flatten(2).transpose(1, 2)
-        feat_B = feat_B_orig
+        feat_A_tokens_orig = feat_A_coarse.flatten(2).transpose(1, 2).contiguous()
+        feat_B_tokens_orig = feat_B_coarse.flatten(2).transpose(1, 2).contiguous()
+        feat_A = feat_A_tokens_orig
+        feat_B = feat_B_tokens_orig
+        pos_embed = self._get_pos_embed(Hc, Wc, device, torch.float32).to(feat_A.dtype)
+        feat_A = feat_A + pos_embed
+        feat_B = feat_B + pos_embed
+        for encoder_layer in self.global_encoder:
+            feat_A, feat_B = encoder_layer(feat_A, feat_B)
 
-        pos_embed = self._get_pos_embed(Hc, Wc, device, torch.float32).to(dtype)
+        pos_A = self._get_token_coords(B, Hc, Wc, device, feat_A.dtype)
+        pos_B = self._get_token_coords(B, Hc, Wc, device, feat_B.dtype)
+        temp = self.temperature.clamp(min=0.20, max=1.0).float()
 
-        # 将位置编码注入到自注意力的 Q/K 计算，而不是永久改变 feat
-        feat_A_pos = feat_A + pos_embed
-        feat_B_pos = feat_B + pos_embed
-        feat_A_pos, feat_B_pos = self.attn_layers[0](feat_A_pos, feat_B_pos)
-
-        with torch.no_grad():
-            norm_A_tmp = F.normalize(feat_A_pos.float(), p=2, dim=-1)
-            norm_B_tmp = F.normalize(feat_B_pos.float(), p=2, dim=-1)
-            # 粗略匹配：每个 A token 找 B 中最相似的位置
-            sim_tmp = torch.bmm(norm_A_tmp, norm_B_tmp.transpose(1, 2))  # [B, N, N]
-            prob_tmp = F.softmax(sim_tmp / 0.5, dim=-1)  # temperature=0.5
-            pos_B_tmp = self._get_token_coords(B, Hc, Wc, device, feat_A_pos.dtype)
-            # 期望坐标：[B, N, 2]
-            expected_pos_B = torch.bmm(prob_tmp.to(feat_B_pos.dtype), pos_B_tmp)
-            # 将 B 特征按预测的对应关系 warp 到 A 坐标系
-            # expected_pos_B: [B, N, 2] → reshape → [B, Hc, Wc, 2]（作为 grid）
-            warp_grid_tmp = expected_pos_B.reshape(B, Hc, Wc, 2)
-
-        # 将 B 的特征 warp 到 A 的空间位置
-        feat_B_warped_chw = F.grid_sample(
-            feat_B.transpose(1, 2).reshape(B, -1, Hc, Wc).float(),  # ← 使用 feat_B（无 pos）
-            warp_grid_tmp.float(),
-            mode='bilinear', padding_mode='border', align_corners=False
-        ).to(feat_B_pos.dtype)
-        feat_B_warped = feat_B_warped_chw.reshape(B, -1, Hc * Wc).transpose(1, 2)
-
-        # 在 warp 后为 B 特征重新注入位置编码（代表 A 坐标系中的位置）
-        feat_B_warped = feat_B_warped + pos_embed
-
-        # 两层窗口注意力：在已对齐的坐标系内做局部精细匹配
-        feat_A_pos, feat_B_warped = self.attn_layers[1](feat_A_pos, feat_B_warped, Hc, Wc)
-        feat_A_pos, feat_B_warped = self.attn_layers[2](feat_A_pos, feat_B_warped, Hc, Wc)
-
-        feat_A_pos, _ = self.attn_layers[3](feat_A_pos, feat_B_warped)
-
-        feat_A = feat_A_pos
-        feat_B = feat_B_warped
-
-        pos_A = self._get_token_coords(B, Hc, Wc, device, dtype)  # [B, N, 2]
-        pos_B = warp_grid_tmp.reshape(B, Hc * Wc, 2).to(dtype)
-
-        # 特征蒸馏
-        distill_feat_A = self.feature_projector(feat_A)
-        distill_feat_B = self.feature_projector(feat_B_orig)
-
-        temp = self.temperature.clamp(min=0.07, max=1.0).float()
-        norm_A = F.normalize(feat_A.float(), p=2, dim=-1)
-        norm_B = F.normalize(feat_B.float(), p=2, dim=-1)
-        sim_matrix = torch.bmm(norm_A, norm_B.transpose(1, 2)) / temp
-        prob_A_to_B = F.softmax(sim_matrix, dim=-1)  # fp32
-        norm_B_orig = F.normalize(feat_B_orig.float(), p=2, dim=-1)
-        sim_matrix_kl = torch.bmm(norm_A, norm_B_orig.transpose(1, 2)) / temp
-
-        # 分类特征（用于 conf_head 输入）
-        top2_vals = torch.topk(prob_A_to_B, k=2, dim=-1).values
-        top1_prob = top2_vals[..., 0:1]
-        top2_prob = top2_vals[..., 1:2]
-        margin = top1_prob - top2_prob
-        prob_fp32 = prob_A_to_B.float()
-        entropy = -(prob_fp32 * torch.log(prob_fp32.clamp_min(1e-6))).sum(
-            dim=-1, keepdim=True
-        ).to(prob_A_to_B.dtype)
-
-        # 先用粗略期望坐标为 PeakAwareLayer 提供 H 先验去畸变
-        # 注意：这里的 H 只用于 pos_B_for_geo（几何验证辅助），不是最终输出的 H_base
-        pos_B_for_geo = pos_B
-        with torch.no_grad():
-            expected_pos_B_crude = torch.bmm(prob_A_to_B.to(dtype), pos_B)
-            # 用粗略 margin 权重算一个仅供 LocalGeometricValidator 去畸变用的临时 H
-            H_for_geo = solve_robust_base_transform_from_dense_flow(
-                src_pts=pos_A.detach().float(),
-                dst_pts=expected_pos_B_crude.detach().float(),
-                weights=margin.detach().squeeze(-1).float(),
-                H_grid=Hc,
-                W_grid=Wc,
-                bins_y=4,
-                bins_x=4,
-                topk_per_bin=4,
-                min_points=24,
-                min_bins=6,
-                min_quads=2,
-                min_dst_span=0.35,
-                max_shift=0.75,
-                allow_similarity=True,
-                allow_affine=False,
-                return_stats=False,
-            )
-            H_geo_inv = torch.linalg.pinv(H_for_geo.float())
-            H_geo_inv = torch.nan_to_num(H_geo_inv, nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
-            finite_inv = torch.isfinite(H_geo_inv).all(dim=(-2, -1))
-            eye_geo = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).expand(B, -1, -1)
-            H_geo_inv = torch.where(finite_inv.view(B, 1, 1), H_geo_inv, eye_geo)
-
-            pb_homo = torch.cat([pos_B.float(), torch.ones(B, Hc * Wc, 1, device=device, dtype=torch.float32)], dim=-1)
-            pb_in_A = torch.bmm(pb_homo, H_geo_inv.transpose(1, 2))
-            z_A = pb_in_A[..., 2:3]
-            sign_A = z_A.sign()
-            sign_A = torch.where(sign_A == 0, torch.ones_like(sign_A), sign_A)
-            safe_z = torch.where(z_A.abs() < 1e-3, 1e-3 * sign_A, z_A)
-            pos_B_for_geo = (pb_in_A[..., :2] / safe_z).clamp(-10.0, 10.0).to(dtype)
-
-        # PeakAwareLayer：基于粗略去畸变坐标做几何验证
-        refined_warp_coarse, match_entropy, raw_sim_matrix, geo_scores = self.peak_aware_layer(
-            feat_A, feat_B, pos_A, pos_B, Hc, Wc, temp, pos_B_for_geo=pos_B_for_geo
+        coarse_warp_tokens, match_entropy, raw_sim_matrix, geo_scores, match_conf_tokens = self.peak_aware_layer(
+            feat_A, feat_B, pos_A, pos_B, Hc, Wc, temp
         )
-        sim_matrix_for_kl = sim_matrix
-        expected_feat_B = torch.bmm(prob_A_to_B.to(feat_B.dtype), feat_B)
-        feat_diff = torch.abs(feat_A - expected_feat_B)
-        feat_prod = feat_A * expected_feat_B
+        warp_AB_coarse_init = torch.nan_to_num(
+            coarse_warp_tokens.reshape(B, Hc, Wc, 2).float(),
+            nan=0.0,
+            posinf=1.5,
+            neginf=-1.5,
+        ).clamp(-1.5, 1.5).to(feat_A.dtype)
 
-        pos_A_flat = pos_A
-        warp_AB_coarse = refined_warp_coarse.reshape(B, Hc, Wc, 2)
+        confidence_init = _sanitize_tensor(
+            match_conf_tokens.reshape(B, Hc, Wc),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+            clamp=(0.0, 1.0),
+        ).to(feat_A.dtype)
 
-        # Confidence Head
-        conf_input = torch.cat(
-            [feat_diff, feat_prod, top1_prob, top2_prob, margin, entropy, pos_A_flat],
-            dim=-1
+        feat_A_encoded_map = feat_A.transpose(1, 2).reshape(B, -1, Hc, Wc).contiguous()
+        feat_B_encoded_map = feat_B.transpose(1, 2).reshape(B, -1, Hc, Wc).contiguous()
+        fused_A_coarse = self.geometry_fusion(
+            feat_A_encoded_map,
+            feat_B_encoded_map,
+            warp_AB_coarse_init,
+            confidence_init,
         )
-        conf_logits_coarse = self.conf_head(conf_input).squeeze(-1).reshape(B, Hc, Wc)
-        confidence_AB_coarse = torch.sigmoid(conf_logits_coarse)
+        warp_AB_coarse, confidence_AB_coarse, conf_logits_coarse = self.warp_aware_refiner(
+            fused_A_coarse,
+            feat_B_encoded_map,
+            warp_AB_coarse_init,
+            confidence_init,
+        )
         confidence_AB_coarse = _sanitize_tensor(
             confidence_AB_coarse, nan=0.0, posinf=1.0, neginf=0.0, clamp=(0.0, 1.0)
         )
 
-        # WarpRefiner
-        warp_fine_init, overlap_fine_init = upsample_warp_and_overlap(
+        warp_AB_fine, confidence_fine_ch = upsample_warp_and_overlap(
             warp_AB_coarse, confidence_AB_coarse, out_hw=(Hf, Wf)
         )
-        warp_AB_fine, overlap_logits_fine, overlap_fine = self.refiner_64(
-            feat_A=feat_A_fine,
-            feat_B=feat_B_fine,
-            prev_warp=warp_fine_init,
-            prev_overlap=overlap_fine_init,
+        warp_AB_fine = torch.nan_to_num(
+            warp_AB_fine.float(), nan=0.0, posinf=1.5, neginf=-1.5
+        ).clamp(-1.5, 1.5).to(feat_A_fine.dtype)
+        confidence_AB_fine = _sanitize_tensor(
+            confidence_fine_ch.squeeze(-1),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+            clamp=(0.0, 1.0),
         )
-        conf_logits_fine = overlap_logits_fine.squeeze(-1)
-        confidence_AB_fine = overlap_fine.squeeze(-1)
+        warp_AB_fine, confidence_AB_fine, conf_logits_fine = self.warp_aware_refiner_fine(
+            feat_A_fine,
+            feat_B_fine,
+            warp_AB_fine,
+            confidence_AB_fine,
+        )
         confidence_AB_fine = _sanitize_tensor(
             confidence_AB_fine, nan=0.0, posinf=1.0, neginf=0.0, clamp=(0.0, 1.0)
         )
 
-        # 有效重叠掩码（物理含义）
-        # warp_AB_fine[b,i,j] = A(i,j) 在 B 中的归一化坐标
-        # 只有落在 [-1,1]² 内的对应关系才是真正"有图可采样"的有效区域
+        sim_matrix = raw_sim_matrix.float() / temp
+        sim_matrix_kl = sim_matrix
+        prob_A_to_B = F.softmax(sim_matrix, dim=-1)
+        if N_coarse >= 2:
+            top2_vals = torch.topk(prob_A_to_B, k=2, dim=-1).values
+            top1_prob = top2_vals[..., 0:1].to(feat_A.dtype)
+            top2_prob = top2_vals[..., 1:2].to(feat_A.dtype)
+        else:
+            top1_prob = prob_A_to_B.to(feat_A.dtype)
+            top2_prob = torch.zeros_like(top1_prob)
+        margin = top1_prob - top2_prob
+        entropy = match_entropy.reshape(B, Hc, Wc)
+
+        distill_feat_A = self.feature_projector(feat_A)
+        distill_feat_B = self.feature_projector(feat_B_tokens_orig)
+
         valid_overlap_mask = (
             (warp_AB_fine[..., 0] >= -1.0) & (warp_AB_fine[..., 0] <= 1.0) &
             (warp_AB_fine[..., 1] >= -1.0) & (warp_AB_fine[..., 1] <= 1.0)
-        ).float()  # [B, Hf, Wf]，1=有效重叠，0=B 中无对应区域
+        ).float()
 
-        # H 在 refine 后计算，用精化 warp 和 ContextAwareInlierPredictor
-        # 优势：
-        #   a) warp_AB_fine 已经经过 WarpRefiner 修正，残差更小，H 更准
-        #   b) ContextAwareInlierPredictor 用特征差异识别语义假匹配（重复纹理骗不过）
-        #   c) Hartley normalization 确保 DLT 数值稳定，H 不退化为单位阵
         warp_fine_flat = warp_AB_fine.reshape(B, Hf * Wf, 2)
         pos_A_fine = self._get_token_coords(B, Hf, Wf, device, dtype)
-
-        # 对应的 fine 特征（B, N_fine, C）
         feat_A_fine_flat = feat_A_fine.flatten(2).transpose(1, 2)
         feat_B_aligned_for_ransac = safe_grid_sample(
-            feat_B_fine, warp_AB_fine, padding_mode='border', align_corners=False
+            feat_B_fine,
+            warp_AB_fine,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=False,
+        )
+        feat_B_fine_flat = feat_B_aligned_for_ransac.flatten(2).transpose(1, 2)
+
+        fused_A_fine_for_proxy = F.interpolate(
+            fused_A_coarse.to(feat_A_fine.dtype),
+            size=(Hf, Wf),
+            mode='bilinear',
+            align_corners=False,
         )
         H_proxy = self.h_proxy_head(
-            feat_A_fine,
+            fused_A_fine_for_proxy,
             feat_B_aligned_for_ransac,
             warp_AB_fine,
             confidence_AB_fine,
         )
-        feat_B_fine_flat = feat_B_aligned_for_ransac.flatten(2).transpose(1, 2)
 
-        inlier_weights = None
+        raw_inlier = None
+        solver_used = torch.zeros(B, device=device, dtype=torch.bool)
+        solver_weight_balanced = torch.zeros(B, Hf * Wf, device=device, dtype=torch.float32)
         if H_prior is not None:
-            H_to_invert = H_prior.detach()
-
+            # External prior path: no robust dense-flow solver is run, so solver
+            # diagnostics and solver weights must remain zero rather than
+            # reporting confidence-derived values that never entered the solver.
+            H_to_invert = _sanitize_homography(H_prior.detach().to(torch.float32))
+            H_to_invert = _sanitize_base_transform(H_to_invert, max_shift=0.85).detach()
             base_stats = {
-                "base_model_id": torch.full((B,), -1, device=device, dtype=torch.long),
+                "base_model_id": torch.full((B,), -2, device=device, dtype=torch.long),
                 "base_p90": torch.zeros(B, device=device, dtype=torch.float32),
                 "base_points": torch.zeros(B, device=device, dtype=torch.float32),
                 "base_bins": torch.zeros(B, device=device, dtype=torch.float32),
@@ -572,103 +764,93 @@ class AgriMatcher(nn.Module):
                 "base_dst_span_y": torch.zeros(B, device=device, dtype=torch.float32),
             }
         else:
-            # H_to_invert 计算部分
+            valid_overlap_flat = (
+                    (warp_AB_fine[..., 0].abs() <= 1.0) &
+                    (warp_AB_fine[..., 1].abs() <= 1.0)
+            ).reshape(B, Hf * Wf).float().detach()
             if self.use_inlier_predictor:
-                inlier_weights = self.inlier_predictor(
+                raw_inlier = self.inlier_predictor(
                     pos_A_fine.detach(),
                     warp_fine_flat.detach(),
                     feat_A_fine_flat.float(),
                     feat_B_fine_flat.float(),
                 )
-                conf_fine_flat = confidence_AB_fine.reshape(B, Hf * Wf, 1).detach()
-                combined_weights = (inlier_weights * conf_fine_flat).squeeze(-1)
+                solver_weight = (
+                        raw_inlier.squeeze(-1).detach()
+                        * confidence_AB_fine.reshape(B, Hf * Wf).detach()
+                        * valid_overlap_flat
+                )
             else:
-                combined_weights = confidence_AB_fine.reshape(B, Hf * Wf).detach()
-                inlier_weights = None
+                solver_weight = confidence_AB_fine.reshape(B, Hf * Wf).detach() * valid_overlap_flat
 
-            # 先过滤原始置信度，彻底剥夺纯噪声的发言权
-            valid_mask = (combined_weights > 0.1).float()  # [B, N]
-            cw_filtered = combined_weights * valid_mask
-
-            # 计算局部密度并进行空间均匀分配
-            cw_2d = cw_filtered.reshape(B, 1, Hf, Wf)
+            valid_mask = (solver_weight > 0.03).float()
+            solver_weight_raw = solver_weight * valid_mask
+            solver_weight_2d = solver_weight_raw.reshape(B, 1, Hf, Wf)
             local_density = F.avg_pool2d(
-                cw_2d, kernel_size=9, stride=1, padding=4, count_include_pad=False
+                solver_weight_2d, kernel_size=9, stride=1, padding=4, count_include_pad=False
             )
-
-            # 密集区降权，稀疏区提权
-            spatially_spread = cw_2d / (local_density + 1e-4)
-
-            # 能量守恒归一化，保证空间重分配后，总的 Data Term 能量(权重总和)不变，从而与 reg_lambda 完美抗衡
-            original_energy = cw_2d.view(B, -1).sum(dim=1, keepdim=True)
-            new_energy = spatially_spread.view(B, -1).sum(dim=1, keepdim=True)
+            solver_weight_spread = solver_weight_2d / (local_density + 1e-4)
+            original_energy = solver_weight_2d.view(B, -1).sum(dim=1, keepdim=True)
+            new_energy = solver_weight_spread.view(B, -1).sum(dim=1, keepdim=True)
             scale_factor = original_energy / (new_energy + 1e-8)
-
-            spatially_spread = spatially_spread * scale_factor.view(B, 1, 1, 1)
-
-            # Clamp 防止个别极端孤立点被放大到毁掉整个 DLT (3.0 是个非常安全的物理上限)
-            spatially_spread = spatially_spread.clamp(0, 3.0)
-
-            combined_weights_final = spatially_spread.reshape(B, Hf * Wf)
+            solver_weight_spread = (solver_weight_spread * scale_factor.view(B, 1, 1, 1)).clamp(0, 3.0)
+            solver_weight_balanced = solver_weight_spread.reshape(B, Hf * Wf)
 
             with torch.no_grad():
                 H_to_invert, base_stats = solve_robust_base_transform_from_dense_flow(
                     src_pts=pos_A_fine.float(),
                     dst_pts=warp_fine_flat.detach().float(),
-                    weights=combined_weights_final.detach().float(),
+                    weights=solver_weight_balanced.detach().float(),
                     H_grid=Hf,
                     W_grid=Wf,
                     bins_y=8,
                     bins_x=8,
                     topk_per_bin=8,
                     min_points=48,
-                    min_bins=14,
-                    min_quads=3,
-                    min_dst_span=0.45,
+                    min_bins=10,
+                    min_quads=2,
+                    min_dst_span=0.25,
                     max_shift=0.75,
                     allow_similarity=True,
                     allow_affine=True,
                     return_stats=True,
                 )
-
             H_to_invert = H_to_invert.detach()
+            solver_used = torch.ones(B, device=device, dtype=torch.bool)
 
-        return {
-            # 匹配矩阵
+        out = {
             'sim_matrix': sim_matrix,
             'sim_matrix_kl': sim_matrix_kl,
+            'raw_sim_matrix': raw_sim_matrix,
             'geo_scores': geo_scores,
+            'entropy': entropy,
+            'match_confidence': match_conf_tokens.reshape(B, Hc, Wc),
             'top1_prob': top1_prob,
-
-            # Coarse 输出
+            'top2_prob': top2_prob,
+            'margin': margin,
             'warp_AB_coarse': warp_AB_coarse,
+            'warp_AB_coarse_init': warp_AB_coarse_init,
             'confidence_AB_coarse': confidence_AB_coarse,
+            'confidence_AB_coarse_init': confidence_init,
             'conf_logits_coarse': conf_logits_coarse,
-
-            # Fine 输出
             'warp_AB': warp_AB_fine,
             'confidence_AB': confidence_AB_fine,
             'conf_logits': conf_logits_fine,
-
-            # 蒸馏特征
             'distill_feat_A': distill_feat_A,
             'distill_feat_B': distill_feat_B,
-
-            # Fine 特征
             'feat_A_64': feat_A_fine,
             'feat_B_64': feat_B_fine,
-
-            # 动态尺寸信息
             'coarse_hw': (Hc, Wc),
             'fine_hw': (Hf, Wf),
-
-            # Base transform
             'H_base': H_to_invert,
             'H_proxy': H_proxy,
-            'inlier_weights': inlier_weights,
+            'inlier_weights': raw_inlier,
+            'raw_inlier_weights': raw_inlier,
+            'solver_weights': solver_weight_balanced.detach(),
+            'solver_weight_mean': solver_weight_balanced.detach().mean(),
+            'solver_weight_nonzero_ratio': (solver_weight_balanced.detach() > 0.0).float().mean(),
+            'solver_used': solver_used,
             'valid_overlap_mask': valid_overlap_mask,
-
-            # 诊断信息
             'base_model_id': base_stats['base_model_id'],
             'base_p90': base_stats['base_p90'],
             'base_points': base_stats['base_points'],
@@ -677,10 +859,12 @@ class AgriMatcher(nn.Module):
             'base_dst_span_x': base_stats['base_dst_span_x'],
             'base_dst_span_y': base_stats['base_dst_span_y'],
         }
+        return out
 
     @staticmethod
     def _token_coords(B: int, gs: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        # 与 RoMa v2 的 get_normalized_grid 一致：align_corners=False 的像素中心坐标
+        # Match the normalized pixel-center convention used by RoMa-style grids
+        # with align_corners=False.
         if gs == 1:
             coords = torch.zeros((1, 2), device=device, dtype=dtype)
             return coords.unsqueeze(0).expand(B, -1, -1)
@@ -700,7 +884,7 @@ class AgriMatcher(nn.Module):
 
     def _get_pos_embed(self, H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
-        动态生成傅里叶位置编码
+        Generate Fourier positional encodings for the current coarse feature map.
 
         Returns:
             pos_embed: (1, H*W, d_model)
@@ -730,7 +914,7 @@ class AgriMatcher(nn.Module):
 
     def _get_token_coords(self, B: int, H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
-        动态生成 token 坐标
+        Generate normalized token coordinates for a dynamic H x W grid.
 
         Returns:
             (B, H*W, 2)
@@ -742,7 +926,7 @@ class AgriMatcher(nn.Module):
         return coords.unsqueeze(0).expand(B, -1, -1)
 
     def _clamp_coords(self, xy: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        """裁剪坐标到有效范围"""
+        """Clamp normalized coordinates to the valid feature-grid range."""
         if H <= 1 or W <= 1:
             return xy
         x = xy[..., 0].clamp(min=-1.0 + 1.0 / W, max=1.0 - 1.0 / W)
@@ -751,20 +935,45 @@ class AgriMatcher(nn.Module):
 
 
 class AgriStitcher(nn.Module):
-    def __init__(self, matcher_config, decoder_config=None):
+    def __init__(
+            self,
+            matcher_config,
+            decoder_config=None,
+            residual_mode: str = "mesh",
+            mesh_size: int = 12,
+            max_residual_px: float = 4.0,
+    ):
         super().__init__()
         self.matcher = AgriMatcher(**matcher_config)
         decoder_config = decoder_config or {}
+        self.residual_mode = str(decoder_config.get("residual_mode", residual_mode)).lower()
         feat_channels = int(decoder_config.get("feat_channels", matcher_config.get("d_model", 128)))
         decoder_hidden = int(decoder_config.get("decoder_hidden", 128))
         decoder_blocks = int(decoder_config.get("decoder_blocks", 3))
         residual_scale = float(decoder_config.get("residual_scale", 0.08))
-        self.stitch_decoder = StitchingDecoder(
-            feat_channels=feat_channels,
-            hidden=decoder_hidden,
-            num_blocks=decoder_blocks,
-            residual_scale=residual_scale,
-        )
+        mesh_size = int(decoder_config.get("mesh_size", mesh_size))
+        max_residual_px = float(decoder_config.get("max_residual_px", max_residual_px))
+
+        if self.residual_mode == "dense":
+            self.stitch_decoder = StitchingDecoder(
+                feat_channels=feat_channels,
+                hidden=decoder_hidden,
+                num_blocks=decoder_blocks,
+                residual_scale=residual_scale,
+            )
+        elif self.residual_mode == "mesh":
+            self.stitch_decoder = MeshStitchingDecoder(
+                feat_channels=feat_channels,
+                hidden=decoder_hidden,
+                num_blocks=decoder_blocks,
+                mesh_size=mesh_size,
+                max_residual_px=max_residual_px,
+                min_mask_bias=float(decoder_config.get("min_mask_bias", -3.0)),
+            )
+        elif self.residual_mode == "none":
+            self.stitch_decoder = None
+        else:
+            raise ValueError(f"Unknown residual_mode={self.residual_mode!r}; expected dense, mesh, or none")
 
     def forward(self, img_A, img_B, H_prior=None):
         m_out = self.matcher(img_A, img_B, H_prior=H_prior)
@@ -776,19 +985,28 @@ class AgriStitcher(nn.Module):
         dtype = warp_AB.dtype
 
         H_img, W_img = img_A.shape[2], img_A.shape[3]
-        H_base_safe = _sanitize_homography(m_out['H_base'].detach().to(torch.float32))
-        H_base_safe = _sanitize_base_transform_no_inplace(H_base_safe, max_shift=0.85)
-        base_grid = project_grid_with_h(H_base_safe, B, H_img, W_img, device)
+        # Three-H formulation:
+        # H_solver is the robust no-grad estimate from dense correspondences.
+        # H_delta is the learnable correction predicted by the matcher head.
+        # H_final is the trainable base transform used by the stitching path.
+        H_solver = _sanitize_homography(m_out['H_base'].detach().to(torch.float32))
+        H_solver = _sanitize_base_transform(H_solver, max_shift=0.85)
 
-        H_proxy = m_out.get('H_proxy')
-        if H_proxy is not None:
-            H_proxy_safe = _sanitize_base_transform_no_inplace(H_proxy.to(torch.float32), max_shift=0.85)
-            H_proxy_grid_train = project_grid_with_h(H_proxy_safe, B, H_img, W_img, device)
+        H_delta = m_out.get('H_proxy')
+        if H_delta is not None:
+            H_delta = _sanitize_base_transform(H_delta.to(torch.float32), max_shift=0.85)
+            H_final = torch.bmm(H_delta, H_solver.detach())
+            H_final = _sanitize_homography(H_final)
+            H_final = _sanitize_base_transform(H_final, max_shift=0.85)
         else:
-            H_proxy_safe = None
-            H_proxy_grid_train = None
+            H_final = H_solver
 
-        # 基于 H 将图像 B 和 fine 特征 B 对齐到 A 坐标系
+        grid_solver_nograd = project_grid_with_h(H_solver, B, H_img, W_img, device).detach()
+        grid_base_train = project_grid_with_h(H_final, B, H_img, W_img, device)
+        if self.training and H_delta is not None and not grid_base_train.requires_grad:
+            raise RuntimeError("H_base_grid_train must require grad in training when H_delta is available.")
+        base_grid = grid_base_train
+
         with torch.amp.autocast("cuda", enabled=False):
             img_B_warped = F.grid_sample(
                 torch.nan_to_num(img_B.float(), nan=0.0, posinf=0.0, neginf=0.0),
@@ -805,13 +1023,29 @@ class AgriStitcher(nn.Module):
             align_corners=False,
         )
 
-        residual_flow, mask_logits, stitch_mask = self.stitch_decoder(
-            img_A=img_A,
-            img_B_warped=img_B_warped,
-            feat_A=m_out['feat_A_64'],
-            feat_B_warped=feat_B_aligned,
-            base_grid=base_grid.to(img_A.dtype),
-        )
+        aux = {}
+        if self.residual_mode == "none":
+            residual_flow = torch.zeros_like(base_grid, dtype=img_A.dtype)
+            mask_logits = torch.full((B, H_img, W_img, 1), -20.0, device=device, dtype=img_A.dtype)
+            stitch_mask = torch.zeros((B, H_img, W_img, 1), device=device, dtype=img_A.dtype)
+        elif self.residual_mode == "dense":
+            residual_flow, mask_logits, stitch_mask = self.stitch_decoder(
+                img_A=img_A,
+                img_B_warped=img_B_warped,
+                feat_A=m_out['feat_A_64'],
+                feat_B_warped=feat_B_aligned,
+                base_grid=base_grid.to(img_A.dtype),
+            )
+        elif self.residual_mode == "mesh":
+            residual_flow, mask_logits, stitch_mask, aux = self.stitch_decoder(
+                img_A=img_A,
+                img_B_warped=img_B_warped,
+                feat_A=m_out['feat_A_64'],
+                feat_B_warped=feat_B_aligned,
+                base_grid=base_grid.to(img_A.dtype),
+            )
+        else:
+            raise RuntimeError(f"Invalid residual_mode={self.residual_mode!r}")
         stitch_residual_flow = _sanitize_tensor(
             residual_flow, nan=0.0, posinf=1.0, neginf=-1.0, clamp=(-1.0, 1.0)
         )
@@ -819,30 +1053,46 @@ class AgriStitcher(nn.Module):
             stitch_mask, nan=0.0, posinf=1.0, neginf=0.0, clamp=(0.0, 1.0)
         )
 
-        final_grid = _sanitize_tensor(
-            base_grid + stitch_mask * stitch_residual_flow,
-            nan=0.0, posinf=3.0, neginf=-3.0, clamp=(-3.0, 3.0)
-        )
+        if self.residual_mode == "none":
+            final_grid = _sanitize_tensor(base_grid, nan=0.0, posinf=3.0, neginf=-3.0, clamp=(-3.0, 3.0))
+        else:
+            final_grid = _sanitize_tensor(
+                base_grid + stitch_mask * stitch_residual_flow,
+                nan=0.0, posinf=3.0, neginf=-3.0, clamp=(-3.0, 3.0)
+            )
         valid_overlap = (
             (final_grid[..., 0] >= -1.0) & (final_grid[..., 0] <= 1.0) &
             (final_grid[..., 1] >= -1.0) & (final_grid[..., 1] <= 1.0)
         ).to(conf_AB.dtype)
 
-        return {
+        out = {
             'dense_grid': final_grid,
             'stitch_residual_flow': stitch_residual_flow,
             'stitch_mask': stitch_mask,
             'stitch_mask_logits': mask_logits,
             'valid_overlap_mask': valid_overlap,
             'matcher_out': m_out,
-            'H_mat': H_base_safe,
-            'H_proxy': H_proxy,
-            'H_proxy_mat': H_proxy_safe,
-            'H_proxy_grid_train': H_proxy_grid_train,
-            'H_base_grid_nograd': base_grid.detach(),
-            # 直接暴露 base_grid 给可视化（只用 H 的纯单应网格，不含 decoder 残差）
-            'H_base_grid': base_grid.detach(),
+            'H_mat': H_final,
+            'H_solver_nograd': H_solver.detach(),
+            'H_delta': H_delta,
+            'H_final': H_final,
+            'H_proxy': H_delta,
+            'H_proxy_mat': H_delta,
+            # Deprecated alias: this is H_final's train grid, not the old standalone H_proxy grid.
+            'H_proxy_grid_train': grid_base_train,
+            'grid_solver_nograd': grid_solver_nograd,
+            'H_base_grid_train': grid_base_train,
+            'H_base_grid_nograd': grid_solver_nograd,
+            'residual_mode': self.residual_mode,
+            'H_base_grid': grid_base_train.detach(),
         }
+        if "mesh_delta" in aux:
+            out["mesh_delta"] = aux["mesh_delta"]
+        if "mesh_mask_lowres" in aux:
+            out["mesh_mask_lowres"] = aux["mesh_mask_lowres"]
+        if aux:
+            out["mesh_regularization_inputs"] = aux
+        return out
 
 
 if __name__ == "__main__":
