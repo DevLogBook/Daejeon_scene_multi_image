@@ -20,6 +20,11 @@ __pycache__/
 
 .idea/
 .vscode/
+.claude/
+.codex/
+.cursor/
+.agents/
+.codegraph/
 
 ############################
 # OS
@@ -128,5 +133,87 @@ teacher_cache/
 # Generated manifests / outputs
 ############################
 
+/pair.txt
+/pairs_2.txt
+/uav_cropped_pairs.txt
 dataset/*pairs*.txt
 output/
+
+
+############################
+# Local scratch / archived generated evidence
+############################
+/.codex_tmp/
+/tmp/
+/archive/legacy_20261020/temporary_evidence/
+/archive/legacy_20261020/sync_packages/
+/archive/legacy_20261020/before_path_updates/
+
+############################
+# Generated training / evaluation data (keep scripts and paper sources)
+############################
+
+/outputs/
+/training_runs/
+/evaluation_outputs/
+/eval_out/
+/result/
+/benchmarks_*/
+/.pet-runs/
+/git_maintenance_*/
+**/events.out.tfevents*
+
+# Binary geometry, depth and array caches
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.exr
+*.ply
+
+# Dataset assets; Python/JSON source and preparation scripts stay visible
+/dataset/UAV3DCrop*/
+/dataset/UAV3DCrop_depth*/
+/dataset/grm_depth_mix_*/
+/dataset/**/rgb/
+/dataset/**/*.jpg
+/dataset/**/*.jpeg
+/dataset/**/*.png
+/dataset/**/*.JPG
+/dataset/**/*.JPEG
+/dataset/**/*.PNG
+/dataset/**/*.tif
+/dataset/**/*.tiff
+
+# Reproducible sync packages and downloaded archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+
+# Local experiments, papers and generated results
+/reports/
+/archive/
+/paper_*/
+/training_plans/
+/v3c_coarse_scoring_*/
+*.csv
+*.jsonl
+*.docx
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.svg
+*.pptx
+*.drawio
+*.vsdx
+*_info.[0-9]*
+*_err.[0-9]*
+.env
+.env.*

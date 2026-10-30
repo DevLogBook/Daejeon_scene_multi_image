@@ -311,9 +311,9 @@ class StitchingDecoder(nn.Module):
         self.residual_scale = float(residual_scale)
         
         # RGB encoder (H, W -> H/8, W/8) captures high-frequency alignment cues.
-        # Input has 6 channels: img_A concatenated with img_B_warped.
+        # Input has 9 channels: img_A, img_B_warped, and their absolute error.
         self.rgb_stem = nn.Sequential(
-            nn.Conv2d(6, 32, kernel_size=3, stride=2, padding=1), nn.GELU(),
+            nn.Conv2d(9, 32, kernel_size=3, stride=2, padding=1), nn.GELU(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), nn.GELU(),
             nn.Conv2d(64, feat_channels, kernel_size=3, stride=2, padding=1), nn.GELU(),
         )
@@ -338,7 +338,7 @@ class StitchingDecoder(nn.Module):
         self.mask_head = nn.Conv2d(16, 1, kernel_size=3, stride=1, padding=1)
         self.flow_head = nn.Conv2d(16, 2, kernel_size=3, stride=1, padding=1)
 
-        nn.init.zeros_(self.mask_head.weight); nn.init.zeros_(self.mask_head.bias)
+        nn.init.zeros_(self.mask_head.weight); nn.init.constant_(self.mask_head.bias, -3.0)
         nn.init.zeros_(self.flow_head.weight); nn.init.zeros_(self.flow_head.bias)
 
     def forward(
@@ -351,8 +351,9 @@ class StitchingDecoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, _, H, W = img_A.shape
         
-        # Encode RGB evidence at reduced resolution.
-        rgb_concat = torch.cat([img_A, img_B_warped], dim=1)
+        # Encode RGB evidence and explicit post-H photometric error.
+        abs_diff = (img_A.float() - img_B_warped.float()).abs().to(img_A.dtype)
+        rgb_concat = torch.cat([img_A, img_B_warped, abs_diff], dim=1)
         rgb_encoded = self.rgb_stem(rgb_concat) # [B, C, H/8, W/8]
 
         # Convert the base grid to a base-flow representation and downsample it.
@@ -392,7 +393,7 @@ class MeshStitchingDecoder(nn.Module):
             num_blocks: int = 3,
             mesh_size: int = 12,
             max_residual_px: float = 4.0,
-            min_mask_bias: float = -3.0,
+            min_mask_bias: float = -1.5,
     ):
         super().__init__()
         self.mesh_size = int(mesh_size)
@@ -400,7 +401,7 @@ class MeshStitchingDecoder(nn.Module):
         self.min_mask_bias = float(min_mask_bias)
 
         self.rgb_stem = nn.Sequential(
-            nn.Conv2d(6, 32, kernel_size=3, stride=2, padding=1), nn.GELU(),
+            nn.Conv2d(9, 32, kernel_size=3, stride=2, padding=1), nn.GELU(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), nn.GELU(),
             nn.Conv2d(64, feat_channels, kernel_size=3, stride=2, padding=1), nn.GELU(),
         )
@@ -435,7 +436,8 @@ class MeshStitchingDecoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         B, _, H, W = img_A.shape
 
-        rgb_concat = torch.cat([img_A, img_B_warped], dim=1)
+        abs_diff = (img_A.float() - img_B_warped.float()).abs().to(img_A.dtype)
+        rgb_concat = torch.cat([img_A, img_B_warped, abs_diff], dim=1)
         rgb_feat = self.rgb_stem(rgb_concat)  # [B, C, H/8, W/8]
         fuse_hw = rgb_feat.shape[-2:]
 
