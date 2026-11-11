@@ -1,0 +1,15 @@
+{
+  "seed": 2026,
+  "severity_fractions": [0.1, 0.3, 0.3, 0.2, 0.1],
+  "max_rotation_degrees": 25.0,
+  "min_scale": 0.8,
+  "max_scale": 1.25,
+  "max_log_stretch": 0.15,
+  "max_shear": 0.08,
+  "translation_fraction": 0.12,
+  "flow_probability": 0.65,
+  "flow_pixels_at_512": 20.0,
+  "flow_gradient_limit": 0.3,
+  "occlusion_probability": 0.15,
+  "curriculum_epochs": 1
+}

@@ -51,7 +51,7 @@ def configure_optimizer(model, stage, *, imc_lr=2e-4, backbone_lr=1e-5,
             group, rate = "geometry", geometry_lr
         elif name.startswith("backbone."):
             group, rate = "backbone", backbone_lr
-        elif name.startswith(("coarse_transformer.", "correlation.", "fpn.coarse_lateral.", "fpn.coarse_output.")):
+        elif name.startswith(("coarse_transformer.", "correlation.", "fpn.coarse_lateral.", "fpn.coarse_output.", "fpn.coarse_f8_")):
             group, rate = "coarse", coarse_lr
         else:
             group, rate = "refinement", refinement_lr

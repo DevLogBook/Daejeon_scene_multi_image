@@ -1,0 +1,12 @@
+{
+  "seed": 2026,
+  "split": "val",
+  "size": 512,
+  "modes": ["fixed_7", "fixed_5", "fixed_9", "oracle_5_9", "learned_5_9"],
+  "budgets": [0.1, 0.2, 0.3],
+  "scenarios": ["normal", "repeated_texture", "local_parallax", "weak_texture", "occlusion_low_overlap"],
+  "resolutions": [256, 512],
+  "precisions": ["fp32", "fp16"],
+  "warmup": 5,
+  "repeats": 20
+}

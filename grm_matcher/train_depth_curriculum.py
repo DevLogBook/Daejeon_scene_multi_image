@@ -19,7 +19,7 @@ from .matcher import GRMMatcher
 from .scratch_transfer import ResizedHomographyDataset, check_homography_splits, lr_multiplier
 from .train_stage25 import _atomic_torch_save, _seed_everything
 from .train_scratch_transfer import rng_state, restore_rng, monitor, dataset_signature
-from .depth_curriculum import (PHASES, PREFIXES, GeometryData, TaggedSynthetic, StepMixture,
+from .depth_curriculum import (PHASES, SCRATCH_LR, PREFIXES, GeometryData, TaggedSynthetic, StepMixture,
     CurriculumObjective, phase_mode, parameter_group, make_optimizer, group_indices,
     interleaved_indices, reference_metrics)
 from tools.audit_grm_curriculum_data import audit
@@ -161,6 +161,9 @@ def parse_args(argv=None):
     source = p.add_mutually_exclusive_group(required=True)
     source.add_argument('--init-checkpoint', type=Path)
     source.add_argument('--resume', type=Path)
+    source.add_argument('--scratch-config', type=Path, help='Phase A random initialization; reads JSON only, no checkpoint')
+    p.add_argument('--training-plan', choices=('finetune','scratch'), help='Defaults to the checkpoint plan, or scratch for random initialization')
+    p.add_argument('--require-coarse-mode',choices=('native16','f8','f8_hra'),help='Reject an accidentally selected architecture')
     p.add_argument('--steps', type=int, help='Full phase schedule, not the pilot length')
     p.add_argument('--stop-after-updates', type=int, default=0, help='Additional updates then checkpoint; 0 completes phase')
     p.add_argument('--warmup-updates', type=int, default=500)
@@ -173,6 +176,7 @@ def parse_args(argv=None):
     p.add_argument('--real-fine-min-weight', type=float, default=.5, help='Conservative reference weight mask, not proof of GT accuracy')
     p.add_argument('--disable-real-fine', action='store_true')
     p.add_argument('--min-lr-ratio', type=float, default=.1)
+    p.add_argument('--lr-scale', type=float, default=1., help='Scale every phase peak LR; default preserves existing curriculum')
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--gradient-clip', type=float, default=1.)
     p.add_argument('--num-workers', type=int, default=2)
@@ -191,10 +195,16 @@ def parse_args(argv=None):
         p.error('Intervals/anchor count/clip must be positive')
     if not 0 < args.min_lr_ratio <= 1 or not 0 <= args.real_fine_min_weight <= 1 or not 0 <= args.anchor_jitter <= 8:
         p.error('Invalid LR ratio, fine weight mask or jitter (maximum8 input pixels)')
+    if not math.isfinite(args.lr_scale) or args.lr_scale <= 0:
+        p.error('lr-scale must be finite and positive')
     if args.resume and (args.evaluate_only or args.compare_checkpoints):
         p.error('Evaluate candidates using --init-checkpoint, not --resume')
     if args.compare_checkpoints:
         args.evaluate_only = True
+    if args.scratch_config and (args.phase!='A' or args.evaluate_only):
+        p.error('--scratch-config is only for fresh phase A training/audit')
+    if args.scratch_config and args.training_plan=='finetune':
+        p.error('--scratch-config requires the scratch training plan')
     return args
 
 
@@ -202,8 +212,9 @@ def build_data(args, config):
     audit_result = audit(args.geometry_cache/'preparation.json', args.geometry_cache)
     if audit_result['errors']:
         raise ValueError('Geometry audit failed: '+ '; '.join(audit_result['errors'][:10]))
-    if config.coarse_stride != 16:
-        raise ValueError('v1 geometry cache uses stride16')
+    preparation = json.loads((args.geometry_cache/'preparation.json').read_text(encoding='utf-8-sig'))
+    if preparation.get('coarse_stride',16) != config.coarse_stride:
+        raise ValueError('Geometry/model stride mismatch; regenerate the cache from depth at the model stride')
     split_info = check_homography_splits(args.data_dir)
     sources = {domain: GeometryData(args.geometry_cache, 'train', domain, config) for domain in ('megadepth', 'uav')}
     validation = {domain: GeometryData(args.geometry_cache, 'val', domain, config) for domain in ('megadepth', 'uav')}
@@ -251,8 +262,18 @@ def main(argv=None):
     args = parse_args(argv)
     _seed_everything(args.seed)
     torch.set_num_threads(min(4, torch.get_num_threads()))
-    raw = torch.load(args.resume or args.init_checkpoint, map_location='cpu', weights_only=False)
+    if args.scratch_config:
+        raw=dict(config=json.loads(args.scratch_config.read_text(encoding='utf-8-sig')),training_plan='scratch')
+    else:
+        raw = torch.load(args.resume or args.init_checkpoint, map_location='cpu', weights_only=False)
+    args.training_plan=args.training_plan or raw.get('training_plan','finetune')
+    if not args.scratch_config and args.training_plan!=raw.get('training_plan','finetune'):
+        raise ValueError('Training plan differs from checkpoint; scratch phases must use this scratch run, not historical weights')
     config = GRMMatcherConfig.from_dict(raw['config']); config.use_amp = False
+    if args.require_coarse_mode and config.v3_coarse_mode!=args.require_coarse_mode:
+        raise ValueError('Checkpoint/config coarse mode differs from --require-coarse-mode')
+    if getattr(config,'adaptive_enabled',False):
+        raise ValueError('Depth curriculum trains plain V3/F8/F8-HRA with Adaptive disabled; use the original C/F8 checkpoint, not an Adaptive checkpoint')
     if config.architecture_version != 'v3' or not config.v3_confidence_head:
         raise ValueError('Requires a V3 checkpoint with confidence head; architecture is not upgraded')
     if args.resume and (raw.get('training_recipe') != RECIPE or raw.get('phase') != args.phase):
@@ -263,19 +284,24 @@ def main(argv=None):
             raise ValueError(f'Phase {args.phase} must initialize from curriculum phase {expected}, or restart its own phase')
     sources, validation, data_info = build_data(args, config)
     runtime = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
-               if k not in ('init_checkpoint', 'resume', 'output_dir', 'stop_after_updates', 'num_workers',
+               if k not in ('init_checkpoint', 'resume', 'scratch_config', 'output_dir', 'stop_after_updates', 'num_workers',
                             'device', 'log_every', 'audit_only', 'evaluate_only', 'compare_checkpoints')}
     # Synthetic manifest identity plus source content checks from the existing loader's source split audit.
-    contract = dict(recipe=RECIPE, runtime=runtime, phase_definition=PHASES[args.phase], config=config.to_dict(),
+    definition=dict(PHASES[args.phase],lr=SCRATCH_LR[args.phase]) if args.training_plan=='scratch' else PHASES[args.phase]
+    contract = dict(recipe=RECIPE, runtime=runtime, phase_definition=definition, config=config.to_dict(),
                     geometry_signatures={d: ds.signature for d, ds in sources.items() if d != 'synthetic'},
                     validation_signatures={d: ds.dataset.signature for d, ds in validation.items() if d != 'synthetic'},
                     synthetic_signature=synthetic_signature(args.data_dir, dict(train=sources['synthetic'], val=validation['synthetic'].dataset)),
                     validation_records_sha256=hashlib.sha256(json.dumps(data_info['validation_records'], sort_keys=True).encode()).hexdigest(),
                     code_sha256=code_signature())
-    lineage = raw.get('provenance') if args.resume else dict(initial_checkpoint=str(args.init_checkpoint),
-        initial_checkpoint_sha256=file_sha256(args.init_checkpoint), parent_recipe=raw.get('training_recipe'),
-        parent_phase=raw.get('phase'), parent_phase_step=raw.get('phase_step'), parent=raw.get('provenance'))
-    summary = dict(recipe=RECIPE, contract=contract, provenance=lineage, torch_version=str(torch.__version__),
+    if args.scratch_config:
+        lineage=dict(initialization='random',seed=args.seed,architecture_config=str(args.scratch_config),
+            architecture_config_sha256=file_sha256(args.scratch_config),initial_checkpoint=None)
+    else:
+        lineage = raw.get('provenance') if args.resume else dict(initial_checkpoint=str(args.init_checkpoint),
+            initial_checkpoint_sha256=file_sha256(args.init_checkpoint), parent_recipe=raw.get('training_recipe'),
+            parent_phase=raw.get('phase'), parent_phase_step=raw.get('phase_step'), parent=raw.get('provenance'))
+    summary = dict(recipe=RECIPE, training_plan=args.training_plan, contract=contract, provenance=lineage, torch_version=str(torch.__version__),
                    precision='FP32', accumulation_steps=10,
                    source_pairs={d: len(ds) for d, ds in sources.items()},
                    validation_pairs={d: len(ds) for d, ds in validation.items()},
@@ -297,7 +323,8 @@ def main(argv=None):
     device = torch.device(args.device)
     if device.type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable; check allocated GPU and driver/PyTorch compatibility')
-    model = GRMMatcher(config).to(device); model.load_state_dict(raw['model'], strict=True)
+    model = GRMMatcher(config).to(device)
+    if not args.scratch_config:model.load_state_dict(raw['model'], strict=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     json_write(args.output_dir/'data_audit.json', data_info['audit'])
     json_write(args.output_dir/'validation_pairs.json', data_info['validation_records'])
@@ -316,7 +343,10 @@ def main(argv=None):
         monitor(args, '[EVALUATION COMPLETE] '+json.dumps([dict(checkpoint=r['checkpoint'], scores=r['scores']) for r in comparison]))
         return
 
-    optimizer = make_optimizer(model, args.phase, args.weight_decay)
+    optimizer = make_optimizer(model, args.phase, args.weight_decay,args.training_plan)
+    for group in optimizer.param_groups:
+        group['lr'] *= args.lr_scale
+        group['peak_lr'] *= args.lr_scale
     objective = CurriculumObjective(config, args.phase, anchor_points=args.anchor_points,
         anchor_jitter=args.anchor_jitter, real_fine_min_weight=args.real_fine_min_weight,
         disable_real_fine=args.disable_real_fine)
@@ -341,7 +371,7 @@ def main(argv=None):
         signal.signal(signal.SIGUSR1, request_stop)
 
     def state():
-        return dict(training_recipe=RECIPE, stage='agri', phase=args.phase, phase_step=step,
+        return dict(training_recipe=RECIPE, training_plan=args.training_plan, stage='agri', phase=args.phase, phase_step=step,
             global_step=step, seen_pairs=step*10, output_dir=str(args.output_dir.resolve()),
             config=config.to_dict(), model=model.state_dict(), optimizer=optimizer.state_dict(),
             contract=contract, rng=rng_state(generator), sampler=dict(seed=args.seed, phase=args.phase, next_update=step),

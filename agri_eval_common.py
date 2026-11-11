@@ -72,6 +72,17 @@ def resize_transform(shape, size):
     return np.array([[sx, 0, (sx - 1) / 2], [0, sy, (sy - 1) / 2], [0, 0, 1]], dtype=float)
 
 
+def letterbox_geometry(width, height, size):
+    ratio = size / max(width, height)
+    nw, nh = max(1, round(width * ratio)), max(1, round(height * ratio))
+    left, top = (size - nw) // 2, (size - nh) // 2
+    matrix = resize_transform((height, width), size)
+    sx, sy = nw / width, nh / height
+    matrix[0] = [sx, 0, left + (sx - 1) / 2]
+    matrix[1] = [0, sy, top + (sy - 1) / 2]
+    return matrix, (left, top, nw, nh)
+
+
 def in_bounds(points, shape):
     h, w = shape[:2]
     return np.isfinite(points).all(1) & (points[:, 0] >= 0) & (points[:, 0] <= w-1) & (points[:, 1] >= 0) & (points[:, 1] <= h-1)
@@ -332,7 +343,7 @@ def aggregate(rows, mode):
 
 def parser(model, mode):
     p = argparse.ArgumentParser(description=f"{model}: {mode} agriculture evaluation; GT is never used to fit H")
-    p.add_argument("--data-root", type=Path, default=Path("D:/Admin/Desktop/homography_dataset" if mode == "synthetic" else "D:/Admin/Desktop/test"))
+    p.add_argument("--data-root", type=Path, default=Path("dataset/homography_dataset" if mode == "synthetic" else "dataset/test"))
     p.add_argument("--output", type=Path, default=Path("evaluation_outputs") / f"{mode}_512")
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--device", default="cuda")

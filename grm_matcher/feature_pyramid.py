@@ -23,6 +23,7 @@ class GRMResidualFPN(nn.Module):
 
     def __init__(self, config: GRMMatcherConfig) -> None:
         super().__init__()
+        self.coarse_mode = config.v3_coarse_mode
         self.coarse_lateral = GRMConvNormAct(
             192, config.coarse_dim, kernel_size=1, activation=False
         )
@@ -47,6 +48,11 @@ class GRMResidualFPN(nn.Module):
         alpha = torch.tensor(config.fpn_fine_alpha_init, dtype=torch.float32)
         # Use logit to ensure that the parameter is unconstrained during optimization.
         self._fine_alpha_logit = nn.Parameter(torch.logit(alpha.clamp(1.0e-4, 1.0 - 1.0e-4)))
+        if self.coarse_mode != "native16":
+            # Retain pretrained C4 context and add an independently trainable C3 path.
+            self.coarse_f8_lateral = nn.Conv2d(128, config.coarse_dim, 1, bias=False)
+            nn.init.dirac_(self.coarse_f8_lateral.weight)
+            self.coarse_f8_gain = nn.Parameter(torch.tensor(-2.0))
 
     @property
     def fine_alpha(self) -> Tensor:
@@ -74,6 +80,10 @@ class GRMResidualFPN(nn.Module):
         fine = self.fine_output(
             self.fine_lateral(features["c2"]) + self.fine_alpha * restricted_high
         )
+        if self.coarse_mode != "native16":
+            coarse = F.interpolate(coarse, size=features["c3"].shape[-2:],
+                                   mode="bilinear", align_corners=False)
+            coarse = coarse + self.coarse_f8_gain.sigmoid() * self.coarse_f8_lateral(features["c3"])
         return {"F_fine": fine, "F_mid": mid, "F_coarse": coarse}
 
     def _validate_features(self, features: Mapping[str, Tensor]) -> None:

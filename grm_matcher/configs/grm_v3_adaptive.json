@@ -1,0 +1,22 @@
+{
+  "architecture_version": "v3",
+  "v3_revision": 1,
+  "classification_mode": "none",
+  "topk_candidates": 1,
+  "max_source_queries": 512,
+  "use_amp": false,
+  "adaptive_enabled": true,
+  "adaptive_mode": "learned_5_9",
+  "adaptive_budget": 0.2,
+  "adaptive_dynamic_budget": false,
+  "adaptive_min_budget": 0.05,
+  "adaptive_max_budget": 0.3,
+  "adaptive_topq": 0.25,
+  "adaptive_detach_risk": true,
+  "adaptive_risk_weight": 0.1,
+  "adaptive_risk_focal_gamma": 0.0,
+  "adaptive_variance": false,
+  "adaptive_variance_weight": 0.01,
+  "adaptive_sigma_min": 0.25,
+  "adaptive_alpha_max": 20.0
+}

@@ -104,7 +104,7 @@ def sample_depth(frame, points):
     return z, inside & np.isfinite(z) & (z > 0)
 
 
-def direction(a, b, size=512, relative_depth=.01, cycle_px=1.0):
+def direction(a, b, size=512, relative_depth=.01, cycle_px=1.0, stride=16):
     """Trusted positive labels on the *training* coarse grid; all others unknown.
 
     cycle_px is measured on the resized/padded training image, never raw pixels.
@@ -112,7 +112,9 @@ def direction(a, b, size=512, relative_depth=.01, cycle_px=1.0):
     """
     ta, _ = letterbox_geometry(a.width, a.height, size)
     tb, _ = letterbox_geometry(b.width, b.height, size)
-    source = coarse_grid(size)
+    if stride not in (8, 16) or size % stride:
+        raise ValueError('Geometry labels require stride 8/16 and a divisible canvas')
+    source = coarse_grid(size, stride)
     original = map_points(source, np.linalg.inv(ta))
     za, good_a = sample_depth(a, original)
     ab = np.linalg.inv(b.c2w) @ a.c2w
@@ -134,8 +136,8 @@ def direction(a, b, size=512, relative_depth=.01, cycle_px=1.0):
     valid &= np.isfinite(cycle) & (cycle <= cycle_px) & (residual <= relative_depth)
     # Conservative supervision mask: target cell center must remain in real RGB,
     # not in padding, even if its subpixel target itself is valid.
-    cells = np.rint((target+.5)/16-.5)
-    centers = (cells+.5)*16-.5
+    cells = np.rint((target+.5)/stride-.5)
+    centers = (cells+.5)*stride-.5
     original_centers = map_points(centers, np.linalg.inv(tb))
     valid &= (original_centers >= 0).all(1) & (original_centers <= [b.width-1,b.height-1]).all(1)
     weight = np.exp(-.5*(cycle/max(cycle_px,1e-8))**2 - .5*(residual/max(relative_depth,1e-8))**2)

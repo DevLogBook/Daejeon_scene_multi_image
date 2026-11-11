@@ -163,8 +163,9 @@ def metric_text(metrics):
              "confidence_brier", "cycle", "overlap", "valid_count", "reachable_fraction",
              "coarse_initial_error_mean", "flow_fraction", "augmentation_strength")
     parts = [f"{key}={metrics[key]:.4f}" for key in names if key in metrics]
-    if "pck3_predicted" in metrics:
-        parts.append(f"candidate_PCK3={metrics['pck3_predicted']:.2%}")
+    for threshold in (1,3,5):
+        if f'pck{threshold}_predicted' in metrics:
+            parts.append(f"candidate_PCK{threshold}={metrics[f'pck{threshold}_predicted']:.2%}")
     if "inlier_tp" in metrics:
         tp, fp, fn = (metrics[key] for key in ("inlier_tp", "inlier_fp", "inlier_fn"))
         parts.append(f"inlier_P@0.5={tp / max(tp + fp, 1e-8):.2%}")
@@ -174,12 +175,28 @@ def metric_text(metrics):
 
 def append_epoch_csv(path, record):
     row = {"epoch": record["epoch"], "best_updated": record["best_updated"],
-           "best_validation_loss": record["best_validation_loss"]}
+           "best_validation_loss": record["best_validation_loss"],
+           "best_pck1_updated":record.get('best_pck1_updated',False),
+           "best_validation_pck1":record.get('best_validation_pck1')}
     for group in ("train", "validation", "lr"):
         row.update({f"{group}/{key}": value for key, value in record[group].items()})
     exists = path.exists() and path.stat().st_size > 0
+    fieldnames=list(row)
+    if exists:
+        with path.open('r',encoding='utf-8',newline='') as stream:
+            reader=csv.DictReader(stream);previous_fields=reader.fieldnames
+            additions=[key for key in row if key not in previous_fields]
+            previous=list(reader) if additions else []
+        fieldnames=previous_fields+additions
+        if additions:
+            temporary=path.with_suffix(path.suffix+'.tmp')
+            with temporary.open('w',encoding='utf-8',newline='') as stream:
+                writer=csv.DictWriter(stream,fieldnames=fieldnames);writer.writeheader()
+                writer.writerows(previous);writer.writerow(row)
+            temporary.replace(path)
+            return
     with path.open("a", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(row))
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
         if not exists:
             writer.writeheader()
         writer.writerow(row)
@@ -248,6 +265,9 @@ def run_epoch(model, objective, loader, optimizer, args, device, epoch,
             averages = {key: value / active for key, value in totals.items()} if active else {}
             if args.stage == "agri" and totals.get("predicted_matches", 0.) > 0:
                 averages["pck3_predicted"] = totals["correct_at_3px"] / totals["predicted_matches"]
+                for threshold in (1,5):
+                    if f'correct_at_{threshold}px' in totals:
+                        averages[f'pck{threshold}_predicted']=totals[f'correct_at_{threshold}px']/totals['predicted_matches']
             # No LR has been used yet before the first optimizer update.
             lrs = {g["name"]: g["lr"] for g in optimizer.param_groups} if schedule_step else {}
             eta = elapsed / batches * (len(loader) - batches)
@@ -274,6 +294,9 @@ def run_epoch(model, objective, loader, optimizer, args, device, epoch,
                  batches=batches, seconds=time.monotonic() - start)
     if args.stage == "agri":
         means["pck3_predicted"] = totals.get("correct_at_3px", 0.) / max(1., totals.get("predicted_matches", 0.))
+        for threshold in (1,5):
+            if f'correct_at_{threshold}px' in totals:
+                means[f'pck{threshold}_predicted']=totals[f'correct_at_{threshold}px']/max(1.,totals.get('predicted_matches',0.))
         if "inlier_tp" in totals:
             tp, fp, fn = (totals[key] for key in ("inlier_tp", "inlier_fp", "inlier_fn"))
             means["inlier_precision_at_05"] = tp / max(1., tp + fp)
@@ -402,8 +425,8 @@ def main(argv=None):
     if augmentation is not None:
         contract.update(synthetic_robustness=augmentation.to_dict(), augmentation_recipe='v3_exact_dense_v1')
         signature=hashlib.sha256()
-        for filename in ('robust_synthetic.py','training_v3.py','scratch_transfer.py'):
-            signature.update(Path(__file__).with_name(filename).read_bytes())
+        for path in sorted(Path(__file__).parent.glob('*.py')):
+            signature.update(path.name.encode());signature.update(path.read_bytes())
         contract['robustness_code_signature']=signature.hexdigest()
     # Leave the legacy default contract unchanged for existing run resumes.
     if curriculum is not None:
@@ -424,7 +447,7 @@ def main(argv=None):
         summary.update(v3_revision=config.v3_revision,
             geometry_supervision="no graph, internal H, reranker or Role head",
             confidence_head=config.v3_confidence_head,
-            confidence_supervision="known-pair error <= 3 input pixels; score only; no hard filtering",
+            confidence_supervision="correct visible correspondence <=3 input pixels; known synthetic nonmatches negative; unknown ignored; score only",
             v3_loss_weights={"coarse": 1., "anchor": args.anchor_weight, "predicted_refinement": 1.,
                 "confidence": config.v3_confidence_weight, "cycle": .05, "overlap": .1,
                 "epipolar": args.epipolar_weight if args.stage == "imc" else 0.})
@@ -442,11 +465,13 @@ def main(argv=None):
             print("READ_OK", tuple(sample["image_a"].shape), flush=True)
         return
     start, step, best = 0, 0, math.inf
+    best_pck1 = -1.
     if args.resume:
         if raw["contract"] != contract:
             raise ValueError("Resume contract changed. Keep epochs/LR/data/accumulation unchanged; epochs defines the original cosine horizon")
         optimizer.load_state_dict(raw["optimizer"])
         start, step, best = raw["epoch"] + 1, raw["schedule_step"], raw["best_validation_loss"]
+        best_pck1 = raw.get('best_validation_pck1',-1.)
         restore_rng(raw["rng"], generator)
     elif args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("New runs need an empty output directory; use --resume for an interrupted run")
@@ -479,10 +504,16 @@ def main(argv=None):
         improved = coverage_ok and math.isfinite(score) and score < best
         if improved:
             best = score
+        pck1 = val_metrics.get('pck1_predicted')
+        pck1_improved = (coverage_ok and config.architecture_version=='v3' and pck1 is not None
+                         and math.isfinite(pck1) and pck1>best_pck1)
+        if pck1_improved:
+            best_pck1=pck1
         state = {"training_recipe": 'v3_exact_dense_robustness_v1' if augmentation is not None else 'scratch_imc_exact_h_v1', "stage": args.stage,
             "epoch": epoch, "schedule_step": step, "global_step": step,
             "model": model.state_dict(), "optimizer": optimizer.state_dict(), "config": config.to_dict(),
             "contract": contract, "rng": rng_state(generator), "best_validation_loss": best,
+            "best_validation_pck1": best_pck1,
             "train_metrics": train_metrics, "validation_metrics": val_metrics,
             "provenance": raw.get("provenance") if args.resume else
                 {"random_init": raw is None, "initial_checkpoint": str(args.init_checkpoint) if args.init_checkpoint else None,
@@ -493,16 +524,20 @@ def main(argv=None):
         _atomic_torch_save(state, args.output_dir / "latest.pt")
         if improved:
             _atomic_torch_save(state, args.output_dir / f"best_{args.stage}.pt")
+        if pck1_improved:
+            _atomic_torch_save(state,args.output_dir/'best_pck1.pt')
         if args.save_every and (epoch + 1) % args.save_every == 0:
             _atomic_torch_save(state, args.output_dir / f"epoch_{epoch + 1:04d}.pt")
         record = {"epoch": epoch + 1, "train": train_metrics, "validation": val_metrics,
                   "lr": {g["name"]: g["lr"] for g in optimizer.param_groups}, "best_updated": improved,
-                  "best_validation_loss": best}
+                  "best_validation_loss": best, "best_pck1_updated":pck1_improved,
+                  "best_validation_pck1":best_pck1}
         with (args.output_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         append_epoch_csv(args.output_dir / "metrics.csv", record)
         monitor(args, f"[EPOCH END] {epoch + 1}/{args.epochs} train[{metric_text(train_metrics)}] "
             f"val[{metric_text(val_metrics)}] best_val_loss={best:.4f} best_updated={improved} "
+            f"best_val_PCK1={best_pck1:.2%} pck1_updated={pck1_improved} "
             f"time={(train_metrics['seconds'] + val_metrics['seconds']) / 60:.1f}min")
         monitor(args, f"[CHECKPOINT] saved={args.output_dir / 'latest.pt'}" +
             (f" NEW BEST={args.output_dir / f'best_{args.stage}.pt'}" if improved else ""))

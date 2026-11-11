@@ -30,6 +30,9 @@ class DepthCacheDataset(Dataset):
         preparation=json.loads((self.root/'preparation.json').read_text())
         if preparation['recipe']!='v3_depth_cache_v1': raise ValueError('Unsupported geometry cache')
         self.size=preparation['size']
+        self.coarse_stride=preparation.get('coarse_stride',16)
+        if self.coarse_stride != config.coarse_stride:
+            raise ValueError(f'Geometry cache stride {self.coarse_stride} differs from model stride {config.coarse_stride}; rebuild labels from depth')
         manifest=self.root/split/'manifest.jsonl'
         self.records=[json.loads(line) for line in manifest.read_text().splitlines() if line.strip()]
         self.records=[r for r in self.records if r['domain']==domain]
@@ -73,9 +76,11 @@ class DepthCacheDataset(Dataset):
             for direction in ('ab','ba'):
                 for key in ('target','valid','weight'):
                     result[direction+'_'+key]=torch.from_numpy(data[direction+'_'+key].copy())
-                expected=(self.size//16)**2
+                expected=(self.size//self.coarse_stride)**2
                 if result[direction+'_target'].shape!=(expected,2) or result[direction+'_valid'].shape!=(expected,):
                     raise ValueError('Invalid correspondence grid in cache')
+                if result[direction+'_weight'].shape!=(expected,):
+                    raise ValueError('Invalid geometry weight grid in cache')
         return result
 
 
