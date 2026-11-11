@@ -17,11 +17,12 @@ from .coordinates import flat_indices_to_image_xy, image_xy_to_normalized_grid
 from .depth_finetune import DepthCacheDataset, DepthObjective, masked_mean
 from .imc_dataset import sparse_bidirectional_labels
 from .stage25 import GRMStage25CoarseOutput, _local_probability_nll, transform_points
+from .confidence_supervision import confidence_targets
 
 
 PREFIXES = {
     'backbone': ('backbone.',),
-    'coarse': ('fpn.coarse_lateral.', 'fpn.coarse_output.', 'coarse_transformer.', 'correlation.'),
+    'coarse': ('fpn.coarse_lateral.', 'fpn.coarse_output.', 'fpn.coarse_f8_', 'coarse_transformer.', 'correlation.'),
     'mid': ('fpn.mid_lateral.', 'fpn.coarse_to_mid.', 'fpn.mid_output.', 'mid_refiner.'),
     'fine': ('fpn._fine_alpha_logit', 'fpn.fine_lateral.', 'fpn.mid_to_fine.', 'fpn.fine_output.', 'fine_refiner.'),
     'bridge': ('context_bridge.',),
@@ -34,6 +35,11 @@ PHASES = {
               lr=dict(mid=2e-5, fine=2e-5, bridge=1e-5, confidence=1e-5)),
     'C': dict(steps=5000, quota=dict(megadepth=2, uav=6, synthetic=2),
               lr=dict(backbone=2e-6, coarse=2e-5, mid=1e-5, fine=1e-5, bridge=1e-5, confidence=1e-5)),
+}
+SCRATCH_LR = {
+    'A': dict(backbone=1e-4, coarse=1e-4),
+    'B': dict(mid=1e-4, fine=1e-4, bridge=5e-5, confidence=1e-4),
+    'C': dict(backbone=2e-5, coarse=5e-5, mid=5e-5, fine=5e-5, bridge=5e-5, confidence=5e-5),
 }
 
 
@@ -57,11 +63,12 @@ def phase_mode(model, phase, train):
                 module.eval()
 
 
-def make_optimizer(model, phase, weight_decay):
+def make_optimizer(model, phase, weight_decay, training_plan='finetune'):
     groups = defaultdict(list)
     for name, param in model.named_parameters():
         groups[parameter_group(name)].append(param)
-    rates = PHASES[phase]['lr']
+    if training_plan not in ('finetune','scratch'):raise ValueError('Unknown training plan')
+    rates = SCRATCH_LR[phase] if training_plan=='scratch' else PHASES[phase]['lr']
     return torch.optim.AdamW([dict(name=k, params=groups[k], lr=lr, peak_lr=lr)
                              for k, lr in rates.items() if groups[k]], weight_decay=weight_decay)
 
@@ -140,7 +147,7 @@ class StepMixture(Dataset):
         return self.sources[domain][row]
 
 
-def local_terms(mid, fine, target, initial, known, weight, config, fine_weight, fine_known):
+def local_terms(mid, fine, target, initial, known, weight, config, fine_weight, fine_known, *, fine_only=False):
     """Mid 24px + Fine 8px; strict real Fine quality only affects Fine terms."""
     mr = (config.mid_window_size//2)*config.mid_stride
     fr = (config.fine_window_size//2)*config.fine_stride
@@ -149,11 +156,15 @@ def local_terms(mid, fine, target, initial, known, weight, config, fine_weight, 
     mid_coord = masked_mean(F.smooth_l1_loss(mid.dst_xy, mt, reduction='none').mean(-1), mask, weight)
     mid_nll = _local_probability_nll(mid.local_probability, initial, mt, config.mid_stride, mask, weight, 1e-8)
     fmask = mask & fine_known & (fine_weight > 0)
+    if fine_only:
+        fmask &= ((target-mid.dst_xy.detach()).abs() <= fr).all(-1)
     fine_coord = masked_mean(F.smooth_l1_loss(fine.dst_xy, target, reduction='none').mean(-1), fmask, weight)
     nmask = fmask & ((target-mid.dst_xy.detach()).abs() <= fr).all(-1)
     fine_nll = _local_probability_nll(fine.local_probability, mid.dst_xy.detach(), target,
                                     config.fine_stride, nmask, weight, 1e-8)
-    total = .5*mid_coord + .1*mid_nll + fine_weight*(fine_coord+.1*fine_nll)
+    total = fine_weight*(fine_coord+.1*fine_nll)
+    if not fine_only:
+        total = .5*mid_coord + .1*mid_nll + total
     return total, dict(mid_coordinate=float(mid_coord.detach()), fine_coordinate=float(fine_coord.detach()),
                        mid_nll=float(mid_nll.detach()), fine_nll=float(fine_nll.detach()),
                        local_supervised_count=float(mask.sum()), fine_coordinate_supervised_count=float(fmask.sum()),
@@ -161,6 +172,8 @@ def local_terms(mid, fine, target, initial, known, weight, config, fine_weight, 
 
 
 class CurriculumObjective(DepthObjective):
+    fine_only = False
+
     def __init__(self, config, phase, *, anchor_points=128, anchor_jitter=8., real_fine_min_weight=.5,
                  disable_real_fine=False, capture_prediction=False):
         super().__init__(config, SimpleNamespace(anchor_weight=.25))
@@ -181,10 +194,18 @@ class CurriculumObjective(DepthObjective):
             return 0.
         return .1+.15*min(self.update/1000, 1.) if self.phase == 'B' else .25
 
+    def set_model_mode(self, model, train):
+        phase_mode(model, self.phase, train)
+
+    def fine_reference_mask(self, batch, direction, weight, valid, real):
+        # Subclasses may apply additional Teacher quality masks. Historical
+        # curriculum behavior stays unchanged without such a subclass.
+        return (weight >= self.real_fine_min_weight) if real else valid
+
     def agri(self, model, batch, train, epoch=0):
         self.last_prediction = None
         self.last_reference_errors = None
-        phase_mode(model, self.phase, train)
+        self.set_model_mode(model, train)
         real = batch['domain'][0] != 'synthetic'
         a, b = batch['image_a'], batch['image_b']
         size = a.shape[-1]; h = size//self.config.coarse_stride
@@ -232,7 +253,7 @@ class CurriculumObjective(DepthObjective):
             fa, fb, corr = aux.features_a, aux.features_b, aux.correlation
         coarse_output = GRMStage25CoarseOutput(corr.similarity, corr.matchability_a, corr.matchability_b, h, h)
         zero = corr.matchability_a.sum()*0
-        coarse = self.base.coarse(coarse_output, forward, backward)['total'] if self.phase != 'B' else zero
+        coarse = self.base.coarse(coarse_output, forward, backward)['total'] if self.phase != 'B' and not self.fine_only else zero
         anchor = predicted = confidence = positive = overlap = zero
         ametrics = {}; pmetrics = {}
         gt, gt_valid, gt_weight = directions['ab']
@@ -246,13 +267,17 @@ class CurriculumObjective(DepthObjective):
             if train and self.anchor_jitter:
                 initial = (initial+(torch.rand_like(initial)*2-1)*self.anchor_jitter).clamp(0, size-1)
             am, af = model.refine_points(fa, fb, grid[:, ids], initial, forward.valid_mask[:, ids])
-            fine_known = (forward.confidence[:, ids] >= self.real_fine_min_weight) if real else forward.valid_mask[:, ids]
+            fine_known = self.fine_reference_mask(batch, 'ab', forward.confidence,
+                forward.valid_mask, real)[:, ids]
             anchor, ametrics = local_terms(am, af, forward.fine_dst_xy[:, ids], initial,
-                forward.valid_mask[:, ids], forward.confidence[:, ids], self.config, fw, fine_known)
+                forward.valid_mask[:, ids], forward.confidence[:, ids], self.config, fw, fine_known,
+                fine_only=self.fine_only)
 
         metrics = dict(reference_count=float(gt_valid.sum()), output_matches=0., reference_scored_matches=0.,
                        correct_at_1px=0., correct_at_3px=0., correct_at_5px=0., mid_correct_at_3px=0.,
                        confidence_sum=0., confidence_brier_sum=0., fine_weight=fw if self.phase != 'A' else 0.)
+        metrics.update(output_confidence_supervised_count=0., output_confidence_negative_count=0.,
+                       output_confidence_ignored_count=0., output_confidence_brier_sum=0.)
         if output is not None:
             metrics['output_matches'] = float(output.valid_mask.sum())
             if output.src_xy.shape[1]:
@@ -265,12 +290,23 @@ class CurriculumObjective(DepthObjective):
                     self.last_reference_errors = error[known].detach().cpu().numpy()
                 initial = flat_indices_to_image_xy(aux.target_indices, h, self.config.coarse_stride)
                 if self.phase != 'A':
-                    fknown = (weight >= self.real_fine_min_weight) if real else known
+                    fknown = self.fine_reference_mask(batch, 'ab', gt_weight, gt_valid, real).gather(1, q) & known
                     predicted, pmetrics = local_terms(aux.mid, aux.fine, target, initial, known, weight,
-                                                      self.config, fw, fknown)
-                    if aux.confidence_logits is not None:
+                                                      self.config, fw, fknown, fine_only=self.fine_only)
+                    if aux.confidence_logits is not None and not self.fine_only:
+                        label_known = None
+                        if 'gt_confidence_known_a' in batch:
+                            sampling = image_xy_to_normalized_grid(output.src_xy, size, size).unsqueeze(2)
+                            label_known = F.grid_sample(batch['gt_confidence_known_a'].float(), sampling,
+                                align_corners=False)[:,0,:,0] > .999
+                        ctarget, cmask, cweight = confidence_targets(known, output.valid_mask, error, weight,
+                            real=real, label_known=label_known)
                         confidence = masked_mean(F.binary_cross_entropy_with_logits(aux.confidence_logits,
-                            (error.detach() <= 3).float(), reduction='none'), known, weight)
+                            ctarget, reduction='none'), cmask, cweight)
+                        metrics.update(output_confidence_supervised_count=float(cmask.sum()),
+                            output_confidence_negative_count=float((cmask & ~ctarget.bool()).sum()),
+                            output_confidence_ignored_count=float((output.valid_mask & ~cmask).sum()),
+                            output_confidence_brier_sum=float(((output.p_match.detach()-ctarget).square()*cmask).sum()))
                 metrics['reference_scored_matches'] = float(known.sum())
                 for threshold in (1, 3, 5):
                     metrics[f'correct_at_{threshold}px'] = float(((error <= threshold) & known).sum())
@@ -278,7 +314,7 @@ class CurriculumObjective(DepthObjective):
                 metrics['confidence_sum'] = float(output.p_match[output.valid_mask].detach().sum())
                 metrics['confidence_brier_sum'] = float(((output.p_match.detach()-(error <= 3).float()).square()*known).sum())
 
-        if self.phase != 'B':
+        if self.phase != 'B' and not self.fine_only:
             if real:
                 positive = self.base.coarse._positive_matchability_loss(coarse_output, forward, backward)
             else:

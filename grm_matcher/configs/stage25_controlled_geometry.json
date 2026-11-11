@@ -1,0 +1,13 @@
+{
+  "samples_per_source": 4,
+  "max_rotation_degrees": 8.0,
+  "max_translation_fraction": 0.12,
+  "local_flow_probability": 0.5,
+  "local_region_min": 1,
+  "local_region_max": 3,
+  "local_flow_min_pixels": 4.0,
+  "local_flow_max_pixels": 18.0,
+  "blur_probability": 0.35,
+  "occlusion_probability": 0.35,
+  "noise_std": 0.01
+}

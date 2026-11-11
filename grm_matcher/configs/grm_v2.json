@@ -1,0 +1,13 @@
+{
+  "architecture_version": "v2",
+  "classification_mode": "none",
+  "candidate_peak_radius": 1,
+  "max_source_queries": 512,
+  "topk_candidates": 4,
+  "sampling_mode": "overlap_aware",
+  "support_min_matchability": 0.2,
+  "support_relative_score": 0.1,
+  "min_quota_per_valid_region": 0,
+  "use_dynamic_query_budget": false,
+  "allow_underfilled_budget": true
+}

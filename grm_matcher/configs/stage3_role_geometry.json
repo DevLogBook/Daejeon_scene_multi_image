@@ -1,0 +1,17 @@
+{
+  "samples_per_source": 4,
+  "local_flow_probability": 0.7,
+  "local_region_min": 1,
+  "local_region_max": 3,
+  "local_flow_min_pixels": 4.0,
+  "local_flow_max_pixels": 18.0,
+  "occlusion_probability": 0.35,
+  "max_occlusions": 2,
+  "blur_probability": 0.35,
+  "noise_std": 0.01,
+  "brightness_delta": 0.08,
+  "contrast_min": 0.85,
+  "contrast_max": 1.15,
+  "channel_gain_min": 0.85,
+  "channel_gain_max": 1.15
+}

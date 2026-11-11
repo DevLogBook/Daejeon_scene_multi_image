@@ -6,6 +6,7 @@ from .architecture_v3 import confidence_logits, matching_probability
 from .coordinates import flat_indices_to_image_xy, image_xy_to_normalized_grid
 from .stage25 import GRMStage25CoarseOutput, GRMStage25StudentOutput, transform_points
 from .imc_dataset import sampson_squared, sparse_bidirectional_labels
+from .confidence_supervision import confidence_targets
 
 
 def agricultural_v3(objective, model, batch):
@@ -52,7 +53,11 @@ def supervised_v3(objective, model, a, b, forward, backward, valid_a, valid_b,
     config = model.config
     output = None
     if batch is not None:
-        output, aux = model(a, b, return_auxiliary=True, valid_a=valid_a, valid_b=valid_b)
+        if config.adaptive_enabled and config.adaptive_mode == 'oracle_5_9':
+            from .adaptive import oracle_forward
+            output, aux = oracle_forward(model, batch, return_auxiliary=True)
+        else:
+            output, aux = model(a, b, return_auxiliary=True, valid_a=valid_a, valid_b=valid_b)
         fa, fb, corr = aux.features_a, aux.features_b, aux.correlation
     else:
         fa, fb, ta, tb = model.encode_pair(a, b, valid_a, valid_b)
@@ -70,12 +75,31 @@ def supervised_v3(objective, model, a, b, forward, backward, valid_a, valid_b,
     probability = matching_probability(corr, config)
     target = probability.argmax(-1).gather(1, query)
     initial = flat_indices_to_image_xy(target, w, config.coarse_stride)
-    pm, pf = model.refine_points(fa, fb, forward.src_xy, initial, forward.valid_mask & inside)
+    risk_logits, expand, routing_labels = None, None, None
+    if config.adaptive_enabled:
+        from .adaptive import route_points, search_labels, risk_loss, variance_nll
+        routing_valid = forward.valid_mask & inside & model.points_valid(forward.src_xy, fa)
+        routing_valid &= model.points_valid(forward.fine_dst_xy, fb)
+        risk_logits, expand = route_points(model, corr, query, target, initial, routing_valid,
+                                           forward.fine_dst_xy, routing_valid, compute_risk=True)
+        routing_labels = search_labels(initial, forward.fine_dst_xy, routing_valid, config.mid_stride)
+    pm, pf = model.refine_points(fa, fb, forward.src_xy, initial, forward.valid_mask & inside, mid_expand=expand)
     known = forward.valid_mask & inside & pf.valid_mask
     reachable = ((forward.fine_dst_xy-initial).abs() <= (config.mid_window_size//2)*config.mid_stride).all(-1)
+    if config.adaptive_enabled:
+        radius = (2 + 2*expand.long()) if config.adaptive_mode in ('oracle_5_9', 'learned_5_9') else int(config.adaptive_mode[-1])//2
+        reachable = ((forward.fine_dst_xy-initial).abs() <= (radius[..., None] if torch.is_tensor(radius) else radius)*config.mid_stride).all(-1)
     predicted_labels = replace(forward, coarse_dst_xy=initial, valid_mask=known & reachable)
     predicted = objective.refine(GRMStage25StudentOutput(pm, pf), predicted_labels)['total']
-    cycle = model.direct_cycle(fa, fb, probability, forward.src_xy, pf.dst_xy, known)
+    # Sparse augmented supervision has no exact reverse field at arbitrary endpoints.
+    # Use reverse labels only when no dense/H batch is available for Oracle.
+    if config.adaptive_enabled and config.adaptive_mode == 'oracle_5_9' and batch is None:
+        from .cycle_consistency import GRMCycleConsistencyOutput
+        z = torch.zeros_like(known, dtype=torch.float32)
+        cycle = GRMCycleConsistencyOutput(forward.src_xy, query, z, z, known & False)
+    else:
+        cycle = model.direct_cycle(fa, fb, probability, forward.src_xy, pf.dst_xy, known,
+                                  correlation=corr, oracle_batch=batch if config.adaptive_enabled and config.adaptive_mode == 'oracle_5_9' else None)
     logits = confidence_logits(model, corr, query, target, pm, pf, cycle)
     error = (pf.dst_xy-forward.fine_dst_xy).norm(dim=-1)
     truth = (error.detach() <= 3).float()
@@ -102,7 +126,7 @@ def supervised_v3(objective, model, a, b, forward, backward, valid_a, valid_b,
             if mask.any():
                 terms.append(F.binary_cross_entropy(probability[mask].clamp(1e-6, 1-1e-6), truth_map[mask]))
         overlap = sum(terms)/max(1,len(terms))
-        metrics.update(predicted_matches=0., correct_at_3px=0.)
+        metrics.update(predicted_matches=0., correct_at_1px=0., correct_at_3px=0., correct_at_5px=0.)
     if batch is not None and output.num_matches > 0:
         grid = image_xy_to_normalized_grid(output.src_xy, a.shape[-2], a.shape[-1]).unsqueeze(2)
         visible = F.grid_sample(batch['gt_overlap_a'].float(), grid, mode='nearest', align_corners=False)[:,0,:,0] > .5
@@ -112,15 +136,55 @@ def supervised_v3(objective, model, a, b, forward, backward, valid_a, valid_b,
         else:
             actual_gt = transform_points(output.src_xy, batch['H_ab'])
         actual_error = (output.dst_xy-actual_gt).norm(dim=-1)
-        actual_truth = (visible & (actual_error.detach() <= 3)).float()
-        actual_valid = output.valid_mask
+        label_known = None
+        if 'gt_confidence_known_a' in batch:
+            label_known = F.grid_sample(batch['gt_confidence_known_a'].float(),grid,
+                align_corners=False)[:,0,:,0] > .999
+        actual_truth, actual_valid, _ = confidence_targets(visible, output.valid_mask, actual_error,
+            torch.ones_like(actual_error), real=False, label_known=label_known)
         if aux.confidence_logits is not None and actual_valid.any():
             actual_conf = F.binary_cross_entropy_with_logits(aux.confidence_logits[actual_valid], actual_truth[actual_valid])
             confidence = .5*(confidence+actual_conf)
             brier = (output.p_match[actual_valid]-actual_truth[actual_valid]).square().mean().detach()
-        metrics.update(predicted_matches=float(actual_valid.sum()),
-            correct_at_3px=float((actual_truth.bool() & actual_valid).sum()))
+        metrics.update(predicted_matches=float(output.valid_mask.sum()),
+            correct_at_3px=float((actual_truth.bool() & output.valid_mask).sum()),
+            correct_at_1px=float((visible & (actual_error<=1) & output.valid_mask).sum()),
+            correct_at_5px=float((visible & (actual_error<=5) & output.valid_mask).sum()),
+            output_confidence_supervised_count=float(actual_valid.sum()),
+            output_confidence_negative_count=float((actual_valid & ~actual_truth.bool()).sum()),
+            output_confidence_ignored_count=float((output.valid_mask & ~actual_valid).sum()))
     total = coarse + objective.anchor_weight*anchor + predicted + config.v3_confidence_weight*confidence + .05*cycle_loss + .1*overlap + objective.epipolar_weight*epipolar
+    if config.adaptive_enabled:
+        # Train on the same selected queries and centers as image-only deployment.
+        # Fine failure must not erase a difficult coarse query's risk supervision.
+        risk_labels_for_loss, risk_logits_for_loss = routing_labels, risk_logits
+        if batch is not None:
+            from .adaptive import ground_truth_at, risk_features
+            selected_truth, selected_visible = ground_truth_at(batch, output.src_xy)
+            selected_initial = flat_indices_to_image_xy(aux.target_indices, w, config.coarse_stride)
+            risk_labels_for_loss = search_labels(selected_initial, selected_truth,
+                selected_visible & aux.query_valid_mask, config.mid_stride)
+            risk_logits_for_loss = aux.risk_logits
+            if risk_logits_for_loss is None:
+                features = risk_features(corr, aux.query_indices, aux.target_indices, config.temperature)
+                risk_logits_for_loss = model.search_risk_head(features.detach() if config.adaptive_detach_risk else features)
+        risk = risk_loss(risk_logits_for_loss, risk_labels_for_loss, config.adaptive_risk_focal_gamma) if risk_logits_for_loss is not None else total*0
+        var = total*0
+        if config.adaptive_variance:
+            if batch is not None and aux.calibrated_covariance is not None:
+                var = variance_nll(aux.calibrated_covariance, output.dst_xy-selected_truth,
+                                   selected_visible & output.valid_mask)
+            else:
+                covariance = model.variance_calibrator(pf)
+                var = variance_nll(covariance, pf.dst_xy-forward.fine_dst_xy, known)
+        total = total + config.adaptive_risk_weight*risk + config.adaptive_variance_weight*var
+        metrics.update(risk_loss=risk.detach(), variance_loss=var.detach(),
+                       risk_supervised_count=float(risk_labels_for_loss.supervised.sum()),
+                       risk_positive_count=float(risk_labels_for_loss.expand.sum()),
+                       risk_query_count=float(risk_labels_for_loss.category.numel()),
+                       risk_invisible_count=float((risk_labels_for_loss.category == 3).sum()),
+                       expanded_count=float(aux.expanded_mask.sum()) if batch is not None and aux.expanded_mask is not None else float(expand.sum()),
+                       unrecoverable_count=float((risk_labels_for_loss.category == 2).sum()))
     metrics.update(loss=total.detach(), coarse=coarse.detach(), anchor=anchor.detach(),
         refinement=predicted.detach(), confidence=confidence.detach(), confidence_brier=brier,
         cycle=cycle_loss.detach(), overlap=overlap.detach(), epipolar=epipolar.detach(),

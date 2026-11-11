@@ -394,7 +394,8 @@ class GRMMatcher(nn.Module):
             sigma=self.config.cycle_sigma, forward_valid_mask=valid,
             backward_valid_mask=backward_valid & fine.valid_mask)
 
-    def direct_cycle(self, features_a, features_b, probability, source, destination, valid):
+    def direct_cycle(self, features_a, features_b, probability, source, destination, valid,
+                     *, correlation=None, oracle_batch=None):
         """Reverse-query each actual forward endpoint; no sparse-anchor hop."""
         h, w = features_b["F_coarse"].shape[-2:]
         cells = torch.round((destination.detach()+.5)/self.config.coarse_stride-.5).long()
@@ -403,16 +404,52 @@ class GRMMatcher(nn.Module):
         reverse_top1 = probability.argmax(dim=1)
         initial = flat_indices_to_image_xy(torch.gather(reverse_top1,1,indices),w,self.config.coarse_stride)
         valid = valid & inside & self.points_valid(destination,features_b)
-        mid, fine = self.refine_points(features_b,features_a,destination,initial,valid)
+        expand = None
+        if getattr(self.config,'adaptive_enabled',False) and self.config.adaptive_risk_kind=='ordinal_local':
+            from .ordinal_search import refine_ordinal
+            # Fix reverse cycle at 7 for every new experimental arm, including Oracle.
+            mid,fine,_,_,_=refine_ordinal(self,features_b,features_a,destination,initial,valid,mode='fixed_7')
+            valid=valid & fine.valid_mask & self.points_valid(fine.dst_xy,features_a)
+            error=torch.linalg.vector_norm(source-fine.dst_xy,dim=-1)
+            error=torch.where(valid,error,torch.full_like(error,1e6))
+            return GRMCycleConsistencyOutput(fine.dst_xy,indices,error,torch.exp(-error/self.config.cycle_sigma)*valid,valid)
+        if getattr(self.config,'adaptive_enabled',False) and self.config.adaptive_mode in ('oracle_5_9', 'learned_5_9'):
+            from .adaptive import ground_truth_at, route_points
+            from .correlation import GRMCorrelationOutput
+            if correlation is None:
+                raise ValueError('Adaptive reverse routing requires the existing correlation')
+            reverse = GRMCorrelationOutput(correlation.similarity.transpose(1, 2),
+                correlation.dual_probability.transpose(1, 2), correlation.probability.transpose(1, 2),
+                correlation.matchability_b, correlation.matchability_a)
+            truth, visible = ground_truth_at(oracle_batch, destination, 'b') if oracle_batch is not None else (None, None)
+            _, expand = route_points(self, reverse, indices, reverse_top1.gather(1, indices), initial, valid, truth, visible)
+        if getattr(self.config,'adaptive_enabled',False):
+            mid, fine = self.refine_points(features_b,features_a,destination,initial,valid,mid_expand=expand)
+        else:
+            mid, fine = self.refine_points(features_b,features_a,destination,initial,valid)
         valid = valid & fine.valid_mask & self.points_valid(fine.dst_xy,features_a)
         error = torch.linalg.vector_norm(source-fine.dst_xy,dim=-1)
         error = torch.where(valid,error,torch.full_like(error,1e6))
         return GRMCycleConsistencyOutput(fine.dst_xy,indices,error,torch.exp(-error/self.config.cycle_sigma)*valid,valid)
 
-    def refine_points(self, features_a, features_b, source, initial, valid):
+    def refine_points(self, features_a, features_b, source, initial, valid, *, mid_expand=None):
         valid = valid & self.points_valid(source,features_a)
-        mid = self.mid_refiner(features_a["F_mid"],features_b["F_mid"],source,initial,valid,
-            source_valid_map=features_a.get("valid_mid"), target_valid_map=features_b.get("valid_mid"))
+        if getattr(self.config,'adaptive_enabled',False) and mid_expand is not None and self.config.adaptive_mode in ('oracle_5_9', 'learned_5_9'):
+            from .adaptive import grouped_mid
+            mid = grouped_mid(self.mid_refiner, features_a, features_b, source, initial, valid, mid_expand)
+        else:
+            window_args = {}
+            if getattr(self.config,'adaptive_enabled',False):
+                if self.config.adaptive_mode in ('oracle_5_9', 'learned_5_9'):
+                    # Known-GT anchors use the base search and do not need routing.
+                    window_args['target_window_size'] = 5
+                else:
+                    window_args['target_window_size'] = int(self.config.adaptive_mode[-1])
+            mid = self.mid_refiner(features_a["F_mid"],features_b["F_mid"],source,initial,valid,
+                source_valid_map=features_a.get("valid_mid"), target_valid_map=features_b.get("valid_mid"),
+                **({'projected_features': (self.mid_refiner.correlation.descriptor_projection(features_a['F_mid']),
+                                          self.mid_refiner.correlation.descriptor_projection(features_b['F_mid']))}
+                   if getattr(self.config,'adaptive_enabled',False) else {}), **window_args)
         fine = self.fine_refiner(features_a["F_fine"],features_b["F_fine"],source,mid.dst_xy,mid.valid_mask,
             source_valid_map=features_a.get("valid_fine"), target_valid_map=features_b.get("valid_fine"))
         fine.valid_mask = fine.valid_mask & self.points_valid(fine.dst_xy,features_b)

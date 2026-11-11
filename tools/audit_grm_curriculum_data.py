@@ -25,6 +25,7 @@ def audit(preparation,cache=None):
     errors=[]; warnings=[]
     if meta.get('recipe')!='v3_depth_cache_v1': errors.append('Unsupported or missing preparation recipe')
     if meta.get('size')!=512: errors.append('This plan requires the existing 512 cache')
+    if meta.get('coarse_stride',16) not in (8,16): errors.append('Unsupported coarse grid stride')
     names=[(r['domain'],r['scene']) for r in inventory]
     inventory_groups={(r['domain'],r['scene']):r['group'] for r in inventory}
     if len(set(names))!=len(names): errors.append('Duplicate inventory scene identities')

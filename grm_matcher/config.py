@@ -179,6 +179,10 @@ class GRMMatcherConfig:
     coarse_stride: int = 16
     mid_stride: int = 8
     fine_stride: int = 4
+    # Opt-in F8 experiments. Missing fields preserve historical C checkpoints.
+    v3_coarse_mode: Literal["native16", "f8", "f8_hra"] = "native16"
+    hra_hidden_dim: int = 32
+    hra_max_tokens: int = 1200
 
     backbone_name: Literal["conv", "hybrid_mobilevit"] = "conv"
     backbone_stem_dim: int = 32
@@ -210,6 +214,29 @@ class GRMMatcherConfig:
     v3_revision: int = 0
     v3_min_matchability: float = 0.2
     v3_relative_reliability: float = 0.05
+    # Missing fields retain historical query selection/checkpoint behavior.
+    v3_query_selection: Literal["legacy", "physical_density"] = "legacy"
+    v3_query_radius_px: float = 16.0
+    v3_query_density_strength: float = 1.0
+    # GRM-Adaptive V1 is opt-in; absent fields retain V3's exact modules/path.
+    adaptive_enabled: bool = False
+    adaptive_mode: str = "learned_5_9"
+    adaptive_budget: float = 0.2
+    adaptive_dynamic_budget: bool = False
+    adaptive_min_budget: float = 0.05
+    adaptive_max_budget: float = 0.30
+    adaptive_topq: float = 0.25
+    adaptive_detach_risk: bool = True
+    adaptive_risk_weight: float = 0.1
+    adaptive_risk_focal_gamma: float = 0.0
+    adaptive_variance: bool = False
+    adaptive_variance_weight: float = 0.01
+    adaptive_sigma_min: float = 0.25
+    adaptive_alpha_max: float = 20.0
+    adaptive_risk_kind: str = "binary"
+    ordinal_monotone: bool = True
+    ordinal_recoverability: bool = True
+    ordinal_threshold: float = 0.5
     classification_mode: Literal["role", "inlier", "none"] = "role"
     inlier_loss_weight: float = 0.5
     max_source_queries: int = 256
@@ -331,9 +358,34 @@ class GRMMatcherConfig:
     def validate(self) -> None:
         """Raise ``ValueError`` when a configuration is internally invalid."""
 
+        if self.adaptive_enabled and self.architecture_version != "v3":
+            raise ValueError("Adaptive search requires V3")
+        if self.adaptive_variance and not self.adaptive_enabled:
+            raise ValueError("Variance calibration requires adaptive_enabled")
+        if self.adaptive_mode not in ("fixed_5", "fixed_7", "fixed_9", "oracle_5_9", "learned_5_9", "oracle_5_7_9", "learned_5_7_9"):
+            raise ValueError("Unknown adaptive_mode")
+        if self.adaptive_risk_kind not in ("binary", "ordinal_local"):
+            raise ValueError("Unknown adaptive_risk_kind")
+        if not 0 < self.ordinal_threshold < 1:
+            raise ValueError("ordinal_threshold must lie in (0,1)")
+        if self.adaptive_mode in ("oracle_5_7_9", "learned_5_7_9") and self.adaptive_risk_kind != "ordinal_local":
+            raise ValueError("Three-window routing requires ordinal_local")
+        if not 0 <= self.adaptive_budget <= 1 or not 0 < self.adaptive_topq <= 1:
+            raise ValueError("Invalid adaptive budget/topq")
+        if not 0 <= self.adaptive_min_budget <= self.adaptive_max_budget <= 1:
+            raise ValueError("Invalid adaptive budget bounds")
+        if min(self.adaptive_risk_weight, self.adaptive_variance_weight, self.adaptive_risk_focal_gamma) < 0:
+            raise ValueError("Adaptive loss weights/gamma must be nonnegative")
+        if self.adaptive_sigma_min <= 0 or self.adaptive_alpha_max <= 1:
+            raise ValueError("Invalid variance floor/scale bound")
+
         if self.architecture_version not in ("v1", "v2", "v3"):
             raise ValueError("architecture_version must be v1, v2 or v3")
         if self.architecture_version == "v3":
+            if self.v3_query_selection not in ("legacy", "physical_density"):
+                raise ValueError("Unknown v3_query_selection")
+            if not 0 < self.v3_query_radius_px < float('inf') or not 0 <= self.v3_query_density_strength < float('inf'):
+                raise ValueError("Invalid V3 physical query radius/density strength")
             if self.v3_revision not in (0, 1):
                 raise ValueError("v3_revision must be 0 or 1")
             if not 0 <= self.v3_min_matchability < 1 or not 0 <= self.v3_relative_reliability < 1:
@@ -348,8 +400,15 @@ class GRMMatcherConfig:
             raise ValueError("classification_mode must be role, inlier or none")
         if self.inlier_loss_weight < 0:
             raise ValueError("inlier_loss_weight must be nonnegative")
-        if (self.fine_stride, self.mid_stride, self.coarse_stride) != (4, 8, 16):
-            raise ValueError("The current backbone requires fine/mid/coarse strides 4/8/16")
+        if self.v3_coarse_mode not in ("native16", "f8", "f8_hra"):
+            raise ValueError("Unknown v3_coarse_mode")
+        expected_coarse = 16 if self.v3_coarse_mode == "native16" else 8
+        if self.v3_coarse_mode != "native16" and (self.architecture_version != "v3" or self.v3_revision != 1):
+            raise ValueError("F8 coarse modes require V3 revision 1")
+        if (self.fine_stride, self.mid_stride, self.coarse_stride) != (4, 8, expected_coarse):
+            raise ValueError(f"This coarse mode requires fine/mid/coarse strides 4/8/{expected_coarse}")
+        if self.hra_hidden_dim < 1 or self.hra_max_tokens < 1:
+            raise ValueError("HRA hidden dimension and token budget must be positive")
 
         positive_ints = {
             "input_height": self.input_height,
@@ -386,8 +445,10 @@ class GRMMatcherConfig:
             raise ValueError("input_height must be divisible by coarse_stride.")
         if self.input_width % self.coarse_stride != 0:
             raise ValueError("input_width must be divisible by coarse_stride.")
-        if self.coarse_stride != 2 * self.mid_stride:
+        if self.v3_coarse_mode == "native16" and self.coarse_stride != 2 * self.mid_stride:
             raise ValueError("coarse_stride must equal 2 * mid_stride.")
+        if self.v3_coarse_mode != "native16" and (self.input_height % 16 or self.input_width % 16):
+            raise ValueError("F8 matching still uses a stride16 backbone; input dimensions must be divisible by 16")
         if self.mid_stride != 2 * self.fine_stride:
             raise ValueError("mid_stride must equal 2 * fine_stride.")
         if self.coarse_dim % self.transformer_heads != 0:

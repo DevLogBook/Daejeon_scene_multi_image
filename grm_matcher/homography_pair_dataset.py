@@ -1,10 +1,8 @@
 """Paired Homography dataset loader for the standalone GRM-Matcher.
 
-The manifest/path resolution and resolution-bucket batching logic are adapted
-from ``dense_match/train_homography_gt.py`` without importing that module.  The
-generated dataset contract comes from
-``dataset/generate_single_image_homography_pairs.py``: every saved homography
-maps ``input1`` coordinates to ``input2`` coordinates (A -> B).
+The dataset format is produced by
+dataset/generate_single_image_homography_pairs.py. Each homography maps
+input1 coordinates to input2 coordinates (A -> B).
 """
 
 from __future__ import annotations

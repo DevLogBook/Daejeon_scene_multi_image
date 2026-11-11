@@ -58,6 +58,53 @@ def batch(domain='megadepth'):
     return default_collate([IdentityData(domain)[0]])
 
 
+def test_fine_pilot_respects_actual_window_and_freezes_other_groups(tmp_path, monkeypatch):
+    import grm_matcher.train_real_curriculum as trainer
+    cfg = tiny_config()
+    mask = torch.ones((1, 1), dtype=torch.bool)
+    initial = torch.zeros(1, 1, 2)
+    outside_fine = (cfg.fine_window_size // 2) * cfg.fine_stride + 1.
+    target = torch.tensor([[[outside_fine, 0.]]])
+    mid = SimpleNamespace(dst_xy=initial, valid_mask=mask, local_probability=torch.full(
+        (1, 1, cfg.mid_window_size, cfg.mid_window_size), 1. / cfg.mid_window_size**2))
+    fine = SimpleNamespace(dst_xy=initial.clone().requires_grad_(), valid_mask=mask, local_probability=torch.full(
+        (1, 1, cfg.fine_window_size, cfg.fine_window_size), 1. / cfg.fine_window_size**2))
+    loss, metrics = local_terms(mid, fine, target, initial, mask, mask.float(), cfg, 1., mask, fine_only=True)
+    loss.backward()
+    assert metrics['fine_coordinate_supervised_count'] == 0
+    assert not fine.dst_xy.grad.any()
+
+    class FineData(IdentityData):
+        def __getitem__(self, index):
+            sample = super().__getitem__(index)
+            for direction in ('ab', 'ba'):
+                sample[direction + '_fine_valid'] = sample[direction + '_valid'].clone()
+            return sample
+
+    def build_data(args, config):
+        return ({'megadepth': FineData('megadepth', rows=5)},
+                {'megadepth': FineData('megadepth', rows=1), 'synthetic': IdentityData('synthetic', rows=1)},
+                dict(audit={}, signatures={'fixture': 'v1'}, validation_records={'fixture': 'validation'}))
+
+    monkeypatch.setattr(trainer, 'build_data', build_data)
+    initial = tmp_path / 'initial.pt'
+    torch.manual_seed(7)
+    starting = GRMMatcher(cfg).state_dict()
+    torch.save(dict(config=cfg.to_dict(), model=starting), initial)
+    run = tmp_path / 'fine'
+    result = trainer.main(['--phase', 'R1', '--geometry-cache', str(tmp_path / 'cache'),
+                   '--synthetic-data', str(tmp_path / 'synthetic'), '--init-checkpoint', str(initial),
+                   '--output-dir', str(run), '--fine-pilot-updates', '2', '--epochs', '2',
+                   '--warmup-epochs', '0', '--accumulation-steps', '2', '--size', '64', '--device', 'cpu',
+                   '--num-workers', '0', '--anchor-points', '8', '--eval-every', '2'])
+    assert result['step'] == result['total_steps'] == 2
+    checkpoint = torch.load(run / 'latest.pt', weights_only=False)
+    assert [g['name'] for g in checkpoint['optimizer']['param_groups']] == ['fine']
+    changed = {key for key, value in starting.items() if not torch.equal(value, checkpoint['model'][key])}
+    assert changed and all(parameter_group(key) == 'fine' for key in changed)
+    assert (run / 'best_pck1.pt').exists()
+
+
 class CurriculumTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

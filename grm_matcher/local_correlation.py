@@ -172,6 +172,7 @@ class GRMLocalCorrelation(nn.Module):
         valid_mask: Optional[Tensor] = None,
         source_valid_map: Optional[Tensor] = None,
         target_valid_map: Optional[Tensor] = None,
+        projected_features=None,
     ) -> GRMLocalCorrelationOutput:
         self._validate_inputs(
             feature_source,
@@ -186,8 +187,11 @@ class GRMLocalCorrelation(nn.Module):
                 batch, count, device=feature_source.device, dtype=torch.bool
             )
 
-        projected_source = self.descriptor_projection(feature_source)
-        projected_target = self.descriptor_projection(feature_target)
+        if projected_features is None:
+            projected_source = self.descriptor_projection(feature_source)
+            projected_target = self.descriptor_projection(feature_target)
+        else:
+            projected_source, projected_target = projected_features
         source_patch, source_patch_valid = sample_feature_windows(
             projected_source, source_centers_xy, source_patch_size
         )
@@ -323,6 +327,8 @@ class GRMLocalRefinerCore(nn.Module):
         valid_mask: Optional[Tensor] = None,
         source_valid_map: Optional[Tensor] = None,
         target_valid_map: Optional[Tensor] = None,
+        target_window_size: Optional[int] = None,
+        projected_features=None,
     ) -> GRMRefinementOutput:
         source_feature_xy = image_xy_to_feature_xy(src_xy, self.stride)
         target_feature_xy = image_xy_to_feature_xy(initial_dst_xy, self.stride)
@@ -332,10 +338,11 @@ class GRMLocalRefinerCore(nn.Module):
             source_feature_xy,
             target_feature_xy,
             self.source_patch_size,
-            self.target_window_size,
+            self.target_window_size if target_window_size is None else target_window_size,
             valid_mask,
             source_valid_map,
             target_valid_map,
+            **({'projected_features': projected_features} if projected_features is not None else {}),
         )
         refined_target_feature_xy = target_feature_xy + local.delta_xy
         refined_dst_xy = feature_xy_to_image_xy(

@@ -1,0 +1,11 @@
+{
+  "adaptive_enabled": true,
+  "adaptive_risk_kind": "ordinal_local",
+  "adaptive_mode": "learned_5_7_9",
+  "adaptive_budget": 0.2,
+  "ordinal_monotone": true,
+  "ordinal_recoverability": true,
+  "ordinal_threshold": 0.5,
+  "adaptive_variance": false,
+  "use_amp": false
+}

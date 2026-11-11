@@ -183,10 +183,18 @@ def augment_pair(sample, config, generator, strength):
     overlap_a &= sample_field(overlap_b[None], forward)[0] > .999
     # Reject raster-interpolation inconsistency as well as solver failures.
     returned = sample_field(backward.permute(2,0,1), forward).permute(1,2,0)
-    overlap_a &= (returned-grid).norm(dim=-1) <= config.inverse_tolerance_pixels
+    cycle_good_a = (returned-grid).norm(dim=-1) <= config.inverse_tolerance_pixels
+    overlap_a &= cycle_good_a
     returned_b = sample_field(forward.permute(2,0,1), backward).permute(1,2,0)
-    overlap_b &= (returned_b-grid).norm(dim=-1) <= config.inverse_tolerance_pixels
+    cycle_good_b = (returned_b-grid).norm(dim=-1) <= config.inverse_tolerance_pixels
+    overlap_b &= cycle_good_b
     overlap_b &= sample_field(overlap_a[None], backward)[0] > .999
+    # Visibility=0 can mean a known nonmatch OR a failed geometric solve.
+    # Failed inversion/raster consistency inside the image remains unknown.
+    solver_good = torch.isfinite(forward).all(-1) & (residual <= config.inverse_tolerance_pixels)
+    confidence_known_a = valid_a & (~sample['gt_overlap_a'][0].bool() |
+        (solver_good & (~inside(forward,h,w) | cycle_good_a)))
+    confidence_known_b = valid_b & (occluded | ~inside(backward,h,w) | cycle_good_b)
     # Invalid target pixels remain masked after color/noise, including padding.
     image_a = photometric(a, config, generator, strength)*valid_a[None]
     image_b = photometric(rendered, config, generator, strength)*valid_b[None]
@@ -194,6 +202,7 @@ def augment_pair(sample, config, generator, strength):
                 gt_dense_mapping=forward.permute(2,0,1).contiguous(),
                 gt_dense_mapping_ba=backward.permute(2,0,1).contiguous(),
                 gt_overlap_a=overlap_a[None], gt_overlap_b=overlap_b[None],
+                gt_confidence_known_a=confidence_known_a[None], gt_confidence_known_b=confidence_known_b[None],
                 valid_a=valid_a[None], valid_b=valid_b[None],
                 augmentation_strength=torch.tensor(strength),
                 flow_active=torch.tensor(bool(deformation.abs().max() > 0)),
@@ -248,6 +257,7 @@ class RobustSyntheticDataset(Dataset):
             result={key:sample[key] for key in ('image_a','image_b','H_ab','gt_dense_mapping',
                      'gt_overlap_a','gt_overlap_b','valid_a','valid_b')}
             result.update(gt_dense_mapping_ba=project(pixel_grid(h,w),torch.linalg.inv(sample['H_ab'])).permute(2,0,1).contiguous(),
+                          gt_confidence_known_a=sample['valid_a'].clone(),gt_confidence_known_b=sample['valid_b'].clone(),
                           augmentation_strength=torch.tensor(0.),flow_active=torch.tensor(False),
                           inverse_residual_max=torch.tensor(0.))
         else:

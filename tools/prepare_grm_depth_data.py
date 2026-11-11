@@ -22,13 +22,16 @@ def atomic_json(path, value):
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--megadepth-scenes',type=Path,required=True)
+    p.add_argument('--megadepth-scenes',type=Path)
     p.add_argument('--megadepth-json',type=Path)
-    p.add_argument('--uav-rgb',type=Path,required=True)
-    p.add_argument('--uav-depth',type=Path,required=True)
+    p.add_argument('--uav-rgb',type=Path)
+    p.add_argument('--uav-depth',type=Path)
+    p.add_argument('--domains',nargs='+',choices=('megadepth','uav'),default=['megadepth','uav'])
+    p.add_argument('--exclude-megadepth-scenes',nargs='*',default=[])
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--year',default='2024')
     p.add_argument('--size',type=int,default=512)
+    p.add_argument('--coarse-stride',type=int,choices=(8,16),default=16)
     p.add_argument('--max-pairs-per-scene',type=int,default=300)
     p.add_argument('--max-attempts-per-scene',type=int,default=6000)
     p.add_argument('--min-points',type=int,default=32)
@@ -41,13 +44,19 @@ def main(argv=None):
     p.add_argument('--inspect',action='store_true')
     p.add_argument('--resume',action='store_true')
     args=p.parse_args(argv)
-    if args.size<64 or args.size%32 or min(args.max_pairs_per_scene,args.max_attempts_per_scene,args.min_points)<=0:
+    if args.size<64 or args.size%32 or min(args.max_pairs_per_scene,args.max_attempts_per_scene)<0 or args.min_points<=0:
         p.error('Invalid canvas/limits')
+    if 'megadepth' in args.domains and args.megadepth_scenes is None:
+        p.error('MegaDepth requires --megadepth-scenes')
+    if 'uav' in args.domains and (args.uav_rgb is None or args.uav_depth is None):
+        p.error('UAV requires --uav-rgb and --uav-depth')
     if not 0<=args.min_overlap<args.max_overlap<=1 or min(args.relative_depth,args.cycle_px)<=0:
         p.error('Invalid geometry thresholds')
     cv2.setNumThreads(1)
-    md,missing_md=discover_disk(args.megadepth_scenes,args.megadepth_json)
-    uav,missing_uav=discover_uav(args.uav_rgb,args.uav_depth,args.year)
+    md,missing_md=discover_disk(args.megadepth_scenes,args.megadepth_json) if 'megadepth' in args.domains else ([],[])
+    excluded={str(s).zfill(4) for s in args.exclude_megadepth_scenes}
+    md=[s for s in md if s.name.zfill(4) not in excluded]
+    uav,missing_uav=discover_uav(args.uav_rgb,args.uav_depth,args.year) if 'uav' in args.domains else ([],[])
     scenes=md+uav
     def source_signature(scene):
         digest=hashlib.sha256()
@@ -61,8 +70,9 @@ def main(argv=None):
                     official_pairs=len(s.pairs) if s.pairs else None,source_signature=source_signature(s)) for s in scenes]
     print(json.dumps({'inventory':inventory,'missing_source_files':{'megadepth':len(missing_md),'uav':len(missing_uav)}},indent=2),flush=True)
     if args.inspect:
-        if not md or not uav: raise ValueError('One domain has no usable scene; inspect paths and HDF5 fields')
-        for s in (md[0],uav[0]):
+        if any(not [s for s in scenes if s.domain==d] for d in args.domains):
+            raise ValueError('One selected domain has no usable scene')
+        for s in [next(s for s in scenes if s.domain==d) for d in args.domains]:
             f=s.frames[0]
             depth=read_depth(str(f.depth))
             good=np.isfinite(depth)&(depth>0)
@@ -71,7 +81,24 @@ def main(argv=None):
                 valid_depth_fraction=float(good.mean()),K=f.k.tolist(),c2w=f.c2w.tolist()),indent=2),flush=True)
         return
     override=json.loads(args.split_json.read_text()) if args.split_json else None
-    splits=group_splits(scenes,args.seed,override)
+    if override is not None:
+        override=override.get('group_split',override)
+    # Preserve an existing preparation's groups even when preparing one domain.
+    if override is not None:
+        groups={s.group for s in scenes}
+        if not groups<=set(override): raise ValueError('Split JSON omits a discovered scene/group')
+        splits={g:override[g] for g in groups}
+    elif set(args.domains)=={'megadepth','uav'}:
+        splits=group_splits(scenes,args.seed)
+    else:
+        groups=sorted({s.group for s in scenes})
+        if len(groups)<2: raise ValueError('Need >=2 independent groups for train/val')
+        selected=set(np.random.default_rng(args.seed).permutation(groups)[:max(1,round(.2*len(groups)))])
+        if args.domains==['uav'] and 'uav/corn2' in groups: selected={'uav/corn2'}
+        splits={g:'val' if g in selected else 'train' for g in groups}
+    for domain in args.domains:
+        if {splits[s.group] for s in scenes if s.domain==domain}!={'train','val'}:
+            raise ValueError(f'{domain} needs isolated train AND val groups')
     settings={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items() if k not in ('resume','inspect','output')}
     import grm_matcher.depth_geometry as geometry_module
     settings.update(recipe='v3_depth_cache_v1',inventory=inventory,group_split=splits,
@@ -111,27 +138,30 @@ def main(argv=None):
         temp.replace(args.output/rel)
         record=dict(path=rel,source_sha256=source_hash,identity=identity,source=str(frame.image))
         image_records[identity]=record
-        atomic_json(provenance_path,image_records)
+        # Avoid quadratic metadata IO when exporting complete scenes.
+        if len(image_records)%100==0:
+            atomic_json(provenance_path,image_records)
         return record
     scene_reports=[]
     for scene in scenes:
         accepted=sum(r['domain']==scene.domain and r['scene']==scene.name for r in rows.values())
         attempts=0; rejected={}; started=time.monotonic()
         for i,j in candidate_pairs(scene,args.seed):
-            if accepted>=args.max_pairs_per_scene or attempts>=args.max_attempts_per_scene: break
+            if ((args.max_pairs_per_scene and accepted>=args.max_pairs_per_scene) or
+                (args.max_attempts_per_scene and attempts>=args.max_attempts_per_scene)): break
             a,b=scene.frames[i],scene.frames[j]
             identity=f'{scene.domain}/{scene.name}/{a.key}|{b.key}'
             key=hashlib.sha256(identity.encode()).hexdigest()[:24]
             if key in rows: continue
             attempts+=1
             try:
-                ab=direction(a,b,args.size,args.relative_depth,args.cycle_px)
-                ba=direction(b,a,args.size,args.relative_depth,args.cycle_px)
+                ab=direction(a,b,args.size,args.relative_depth,args.cycle_px,args.coarse_stride)
+                ba=direction(b,a,args.size,args.relative_depth,args.cycle_px,args.coarse_stride)
                 # Denominator is the valid source RGB grid, not the padded canvas.
                 def overlap(frame,labels):
                     from grm_matcher.depth_geometry import coarse_grid,map_points
                     matrix,_=letterbox_geometry(frame.width,frame.height,args.size)
-                    xy=map_points(coarse_grid(args.size),np.linalg.inv(matrix))
+                    xy=map_points(coarse_grid(args.size,args.coarse_stride),np.linalg.inv(matrix))
                     valid=(xy>=0).all(1)&(xy<=[frame.width-1,frame.height-1]).all(1)
                     return float(labels['valid'].sum()/max(1,valid.sum()))
                 ov=[overlap(a,ab),overlap(b,ba)]
@@ -157,7 +187,7 @@ def main(argv=None):
                     from tools.audit_uav3dcrop_depth import overlay
                     from grm_matcher.depth_geometry import coarse_grid,map_points
                     ta,_=letterbox_geometry(a.width,a.height,args.size); tb,_=letterbox_geometry(b.width,b.height,args.size)
-                    overlay(a.image,b.image,map_points(coarse_grid(args.size),np.linalg.inv(ta)),
+                    overlay(a.image,b.image,map_points(coarse_grid(args.size,args.coarse_stride),np.linalg.inv(ta)),
                         map_points(ab['target'],np.linalg.inv(tb)),ab['valid'],args.output/'previews'/f'{scene.domain}_{scene.name}_{accepted}.jpg')
             except (OSError,ValueError,KeyError) as exc:
                 # Every rejected/error pair is recorded, never silently replaced with GT=0.
@@ -169,13 +199,14 @@ def main(argv=None):
         scene_reports.append(dict(domain=scene.domain,scene=scene.name,split=splits[scene.group],
             accepted=accepted,attempts_this_run=attempts,rejected_this_run=rejected,seconds=time.monotonic()-started))
         print(json.dumps(scene_reports[-1]),flush=True)
+        atomic_json(provenance_path,image_records)
     # Reject exact image content leaking across splits, including cross-domain copies.
     hashes={split:{r[key] for r in rows.values() if r['split']==split for key in ('source_sha256_a','source_sha256_b')} for split in ('train','val')}
     if hashes['train'] & hashes['val']: raise ValueError('RGB content overlaps train/val; revise group split')
     counts={}
     for split in ('train','val'):
         selected=sorted((r for r in rows.values() if r['split']==split),key=lambda r:r['pair_id'])
-        for domain in ('megadepth','uav'):
+        for domain in args.domains:
             n=sum(r['domain']==domain for r in selected)
             counts[split+'/'+domain]=n
             if not n: raise ValueError(f'No accepted {split}/{domain} pairs; see diagnostics, do not weaken geometry blindly')

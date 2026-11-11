@@ -117,7 +117,7 @@ debug/
 # External repositories (optional)
 ############################
 
-dense_match/RoMaV2/
+/dense_match/
 backbones/facebookresearch_dinov3*/
 teacher_cache/
 
